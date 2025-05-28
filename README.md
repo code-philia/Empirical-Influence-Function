@@ -130,7 +130,7 @@ for test_sample in testloader:
     print(IF_scores)
 ```
 
-### If you Find our Repo Useful, Please Consider Cite our Paper 
+## If you Find our Repo Useful, Please Consider Cite our Paper 
 
 ```bibex
 @article{liu2022debugging,
