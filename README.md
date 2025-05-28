@@ -129,3 +129,16 @@ for test_sample in testloader:
     IF_scores = IF.query_influence(test_input, test_target)
     print(IF_scores)
 ```
+
+### If you Find our Repo Useful, Please Consider Cite our Paper 
+
+```bibex
+@article{liu2022debugging,
+  title={Debugging and Explaining Metric Learning Approaches: An Influence Function Based Perspective},
+  author={Liu, Ruofan and Lin, Yun and Yang, Xianglin and Dong, Jin Song},
+  journal={Advances in Neural Information Processing Systems},
+  volume={35},
+  pages={7824--7837},
+  year={2022}
+}
+```
