@@ -188,6 +188,103 @@ class EmpiricalIF(BaseInfluenceFunction):
 
         return influence_values
 
+    def reverse_check(
+        self,
+        query_input: torch.Tensor,
+        query_target: torch.Tensor,
+        influence_values: List[float],
+        check_ratio: float = 0.01
+    ):
+        """
+        Perform reverse check by perturbing selected training samples (via gradient ascent and descent),
+        and measuring how they affect the test loss of the query sample.
+
+        Two groups of training samples are considered:
+            1. Most influential (top-k by absolute influence value)
+            2. Least influential (bottom-k by absolute influence value)
+
+        Args:
+            query_input (Tensor): The input tensor for the query (test) sample.
+            query_target (Tensor): The target label for the query (test) sample.
+            influence_values (List[float]): Influence values for all training samples.
+            check_ratio (float): Fraction of training samples to check for each of the two groups.
+
+        Returns:
+            tuple(List[tuple], List[tuple]): (most_influential, least_influential)
+                - most_influential: [(idx, influence_value, reverse_influence_value), ...],
+                - least_influential: [(idx, influence_value, reverse_influence_value), ...],
+        """
+        test_loss_before = calc_loss(self.model, self.criterion, (query_input, query_target))
+        N = len(influence_values)
+        k = max(1, int(N * check_ratio))
+
+        influence_tensor = torch.tensor(influence_values)
+        abs_sorted_indices = torch.argsort(influence_tensor, descending=True)
+
+        # k most influential samples
+        topk_indices = abs_sorted_indices[:k].tolist()
+        # k least influential samples
+        bottomk_indices = abs_sorted_indices[-k:].tolist()[::-1]
+
+        def evaluate_reverse(indices):
+            results = []
+            for idx in indices:
+                # get training sample
+                train_input, train_target = self.dl_train.dataset[idx]
+                train_input = train_input.unsqueeze(0).to(query_input.device)
+                train_target = torch.tensor([train_target]).to(query_input.device)
+
+                train_loss_before = calc_loss(self.model, self.criterion, (train_input, train_target))
+
+                # compute gradients for the training sample
+                train_grad = grad_loss(
+                    model=self.model,
+                    criterion=self.criterion,
+                    dl=(train_input, train_target),
+                    param_filter_fn=self.param_filter_fn
+                )[0]
+                
+                # backup
+                before_update = self.get_filtered_param_snapshot(self.model, self.param_filter_fn)
+
+                # descent
+                self.apply_test_gradient_update(
+                    model=self.model,
+                    test_grad=train_grad,
+                    param_filter_fn=self.param_filter_fn,
+                    lr=1e-3
+                )
+                train_loss_after_descent = calc_loss(self.model, self.criterion, (train_input, train_target))
+                train_loss_change_descent = train_loss_after_descent - train_loss_before # (1,)
+                test_loss_after_descent = calc_loss(self.model, self.criterion, (query_input, query_target))
+                test_loss_change_descent = test_loss_after_descent - test_loss_before # (1,)
+                self.restore_params(self.model, before_update, self.param_filter_fn)
+
+                # ascent
+                self.apply_test_gradient_update(
+                    model=self.model,
+                    test_grad=train_grad,
+                    param_filter_fn=self.param_filter_fn,
+                    lr=-1e-3
+                )
+                train_loss_after_ascent = calc_loss(self.model, self.criterion, (train_input, train_target))
+                train_loss_change_ascent = train_loss_after_ascent - train_loss_before # (1,)
+                test_loss_after_ascent = calc_loss(self.model, self.criterion, (query_input, query_target))
+                test_loss_change_ascent = test_loss_after_ascent - test_loss_before # (1,)
+                self.restore_params(self.model, before_update, self.param_filter_fn)
+
+                reverse_influence_value = (float(test_loss_change_ascent) * float(train_loss_change_ascent) +
+                    float(test_loss_change_descent) * float(train_loss_change_descent)) / 2
+
+                results.append((idx, float(influence_tensor[idx]), reverse_influence_value))
+            return results
+
+        most_influential = evaluate_reverse(topk_indices)
+        least_influential = evaluate_reverse(bottomk_indices)
+        
+        return most_influential, least_influential
+        
+
 class TracIn(BaseInfluenceFunction):
     def query_influence(
         self,

@@ -96,6 +96,23 @@ for test_sample in testloader:
     print(IF_scores) # of size (|dl_train|,)
 ```
 
+You can further validate the influence results by perturbing selected training samples (with highest and lowest influence values, due to time constraints) and observing how they affect the test loss. This serves as a reverse check of influence correctness.
+```python
+most_inf, least_inf = IF.reverse_check(
+    query_input=test_input,
+    query_target=test_target,
+    influence_values=IF_scores,
+    check_ratio=0.01  # top and bottom 1%
+) # [(idx, influence_value, reverse_influence_value), ...], [(idx, influence_value, reverse_influence_value), ...]
+
+for idx, orig_if, rev_if in most_inf:
+    print(f"Top IF sample {idx}: IF={orig_if:.4f}, Reverse IF={rev_if:.4f}")
+
+for idx, orig_if, rev_if in least_inf:
+    print(f"Bottom IF sample {idx}: IF={orig_if:.4f}, Reverse IF={rev_if:.4f}")
+```
+
+
 
 ### Use Original Influence Function
 ```python
