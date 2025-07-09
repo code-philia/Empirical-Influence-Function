@@ -15,9 +15,12 @@ But it does this without re-training — using gradient and Hessian approximatio
 
 ## 🧪 How Influence Function (Understanding Black-box Predictions via Influence Functions, ICML 2017) Works?
 
+<!---
 $$
 \text{Influence}(z_i, z_{\text{test}}) = - \nabla_\theta \mathcal{L}(z_{\text{test}}, \hat{\theta})^\top H_{\hat{\theta}}^{-1} \nabla_\theta \mathcal{L}(z_i, \hat{\theta})
 $$
+!--->
+<img width="450" alt="Screenshot 2025-07-09 at 12 46 53 PM" src="https://github.com/user-attachments/assets/2b51e430-b063-4cf3-abde-1a7e970401c2" />
 
 Where $z_i$ is a training sample, $z_{\text{test}}$ is the test sample, $\hat{\theta}$ are the trained model parameters, $\mathcal{L}$ is the loss function.
 $H_{\hat{\theta}}$ is the Hessian of the **total** training loss at $\hat{\theta}$, i.e. $H_{\hat{\theta}} = \frac{1}{n} \sum_{i=1}^{n} \nabla^2_\theta \mathcal{L}(z_i, \theta) \bigg|_{\theta = \hat{\theta}}$
@@ -38,9 +41,14 @@ In this repository, we also include two lightweight variants of Influence Functi
 
 ### Intuitions of TracIn
 
+<!---
 $$
 \text{Influence}(z_i, z_{\text{test}}) = \frac{1}{T} \sum_{t=1}^T \nabla_\theta \mathcal{L}(z_{\text{test}}, \hat{\theta})^\top \nabla_\theta \mathcal{L}(z_i, \hat{\theta})
 $$
+!--->
+
+<img width="464" alt="Screenshot 2025-07-09 at 12 46 09 PM" src="https://github.com/user-attachments/assets/342a758b-1c37-422e-8ef2-af95533f55a5" />
+
 
 If we have collected $T$ checkpoints during the training process, TracIn estimates the influence of a training point on a test point by computing the **gradient alignment** (dot product) at each checkpoint:
 
