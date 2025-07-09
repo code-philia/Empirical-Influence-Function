@@ -53,15 +53,15 @@ One limitation of TracIn is that it requires recording intermediate checkpoints 
 ### Intuitions of EmpiricalIF
 
 $$
-\text{Influence}(z_i, z_{\text{test}}) = \mathbb{E_{\delta}} \left[ \nabla_\theta \mathcal{L}(z_{\text{test}}, \hat{\theta} + \delta)^\top \nabla_\theta \mathcal{L}(z_i, \hat{\theta} + \delta) \right]
+\text{Influence}(z_i, z_{\text{test}}) = \mathbb{E_{\delta}} \left[ \bigg(\mathcal{L}_{\hat{\theta} + \delta}(z_{\text{test}})-\mathcal{L}_{\hat{\theta}}(z_{\text{test}})\bigg)^\top \bigg(\mathcal{L}_{\hat{\theta} + \delta}(z_i)-\mathcal{L}_{\hat{\theta}}(z_i)\bigg) \right]
 $$
 
-Based on the final checkpoint, EmpiricalIF estimates the **gradient alignment** by perturbing $\hat{\theta}$ with $\delta$, where $\delta \sim \\{x \in \mathbb{R}^d \mid \left\lVert x \right\rVert = r\\}$:
+Based on the final checkpoint, EmpiricalIF estimates the **loss change alignment** by perturbing $\hat{\theta}$ with $\delta$, where $\delta \sim \\{x \in \mathbb{R}^d \mid \left\lVert x \right\rVert = r\\}$:
 - A **positive value** suggests that $z_i$ co-evolve with test $z_{\text{test}}$, i.e. helpful.
 - A **negative value** suggests that $z_i$ conflict with test $z_{\text{test}}$, i.e. harmful.
 
 EmpiricalIF is a _**single-checkpoint**_ relaxation of TracIn.
-In practice, we find setting $\delta$ to be the steepest decent direction of testing and the steepest ascent direction of testing are sufficient for computing EmpiricalIF.
+In practice, we find setting $\delta$ to be the steepest descent direction of testing and the steepest ascent direction of testing are sufficient for computing EmpiricalIF.
 
 ## 🛠️ Requirements
 - Step 1: Install torch, torchvision compatible with your CUDA, see here: [https://pytorch.org/get-started/previous-versions/](https://pytorch.org/get-started/previous-versions/)
