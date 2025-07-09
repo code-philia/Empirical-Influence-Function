@@ -52,9 +52,16 @@ One limitation of TracIn is that it requires recording intermediate checkpoints 
 
 ### Intuitions of EmpiricalIF
 
+<!---
 $$
-\text{Influence}(z_i, z_{\text{test}}) = \mathbb{E_{\delta}} \left[ \bigg(\mathcal{L}_{\hat{\theta} + \delta}(z_{\text{test}})-\mathcal{L}_{\hat{\theta}}(z_{\text{test}})\bigg)^\top \bigg(\mathcal{L}_{\hat{\theta} + \delta}(z_i)-\mathcal{L}_{\hat{\theta}}(z_i)\bigg) \right]
+\text{Influence}(z_i, z_{\text{test}}) = 
+\mathbb{E_{\delta}} \left[ (\mathcal{L}_{\hat{\theta} + \delta}(z_{test})-\mathcal{L}_{\hat{\theta}}(z_{test}))^\top (\mathcal{L}_{\hat{\theta} + \delta}(z_i)-\mathcal{L}_{\hat{\theta}}(z_i)) \right]
 $$
+!--->
+
+<div style="text-align: center;">
+<img width="609" alt="Screenshot 2025-07-09 at 12 30 53 PM" src="https://github.com/user-attachments/assets/c8a46a8a-9a54-43fa-9df3-d076d2be8575" />
+</div>
 
 Based on the final checkpoint, EmpiricalIF estimates the **loss change alignment** by perturbing $\hat{\theta}$ with $\delta$, where $\delta \sim \\{x \in \mathbb{R}^d \mid \left\lVert x \right\rVert = r\\}$:
 - A **positive value** suggests that $z_i$ co-evolve with test $z_{\text{test}}$, i.e. helpful.
