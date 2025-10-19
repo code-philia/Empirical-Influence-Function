@@ -177,4 +177,67 @@ def hessian_vector_product(y: torch.Tensor,
     return hvp
 
 
+class ContrastiveLossWrapper(nn.Module):
+    def forward(self, model: nn.Module, doc_inputs: torch.Tensor, code_inputs: torch.Tensor, is_positive_pair: bool):
+        doc_embeds, code_embeds = model(doc_inputs, code_inputs)
 
+        code_embeds = F.normalize(code_embeds, p=2, dim=1)
+        doc_embeds = F.normalize(doc_embeds, p=2, dim=1)
+
+        cosine_sim = (code_embeds * doc_embeds).sum(dim=1)
+
+        if is_positive_pair:
+            return 1.0 - cosine_sim
+        else:
+            return cosine_sim
+
+@torch.inference_mode()
+def calc_pair_loss(
+    model: nn.Module,
+    criterion: ContrastiveLossWrapper,
+    data: List[Tuple[torch.Tensor, torch.Tensor]],
+    is_positive: bool
+) -> np.ndarray:
+    loss_all = []
+    model.eval()
+    
+    # TODO: batch processing
+    with torch.no_grad():
+        for doc_inputs, code_inputs in tqdm(data, desc="Computing pair losses"):
+            doc_inputs = doc_inputs.to(next(model.parameters()).device)
+            code_inputs = code_inputs.to(next(model.parameters()).device)
+            
+            doc_inputs = doc_inputs.unsqueeze(0) if doc_inputs.dim() == 1 else doc_inputs
+            code_inputs = code_inputs.unsqueeze(0) if code_inputs.dim() == 1 else code_inputs
+            
+            losses = criterion(model, doc_inputs, code_inputs, is_positive_pair=is_positive)
+            loss_all.extend(losses.detach().cpu().numpy())
+            
+    return np.array(loss_all)
+
+
+def grad_pair_loss(
+    model: nn.Module,
+    criterion: ContrastiveLossWrapper,
+    doc_inputs: torch.Tensor,
+    code_inputs: torch.Tensor,
+    is_positive: bool,
+    param_filter_fn: Callable[[str, nn.Parameter], bool] = None
+) -> List[torch.Tensor]:
+    model.eval()
+
+    named_params = list(model.named_parameters())
+    if param_filter_fn:
+        selected_params = [p for n, p in named_params if param_filter_fn(n, p) and p.requires_grad]
+    else:
+        selected_params = [p for _, p in named_params if p.requires_grad]
+
+    code_inputs = code_inputs.to(next(model.parameters()).device)
+    doc_inputs = doc_inputs.to(next(model.parameters()).device)
+    
+    model.zero_grad()
+    with torch.set_grad_enabled(True):
+        loss = criterion(model, doc_inputs, code_inputs, is_positive_pair=is_positive).sum()
+        grad_this = grad(loss, selected_params, create_graph=False)
+        
+    return [g.detach().cpu() for g in grad_this]
