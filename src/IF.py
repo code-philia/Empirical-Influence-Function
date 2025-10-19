@@ -1,4 +1,4 @@
-from src.utils import grad_loss, inverse_hessian_product, calc_loss
+from utils import grad_loss, inverse_hessian_product, calc_loss
 import torchvision
 import torchvision.transforms as transforms
 import torch
