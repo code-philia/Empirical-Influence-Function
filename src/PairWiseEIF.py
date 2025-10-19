@@ -1,4 +1,4 @@
-from utils import ContrastiveLossWrapper, calc_pair_loss, grad_pair_loss
+from utils import ContrastiveLossWrapper, calc_pair_loss, grad_pair_loss, selected_grad_params
 import torch
 from typing import Callable, List, Tuple
 from torch import nn
@@ -37,7 +37,8 @@ class PairWiseEmpiricalIF:
         model: nn.Module,
         param_filter_fn: Callable[[str, nn.Parameter], bool] = None
     ) -> List[torch.Tensor]:
-        return [p.detach().clone() for n, p in model.named_parameters() if (param_filter_fn is None or param_filter_fn(n, p))]
+        selected_params = selected_grad_params(model, param_filter_fn)
+        return [p.detach().clone() for p in selected_params]
 
     @staticmethod
     def restore_params(
@@ -45,11 +46,12 @@ class PairWiseEmpiricalIF:
         param_snapshot: List[torch.Tensor],
         param_filter_fn: Callable[[str, nn.Parameter], bool] = None
     ):
-        idx = 0
-        for n, p in model.named_parameters():
-            if param_filter_fn is None or param_filter_fn(n, p):
-                p.data.copy_(param_snapshot[idx].to(p.device))
-                idx += 1
+        selected_params = selected_grad_params(model, param_filter_fn)
+        if len(param_snapshot) != len(selected_params):
+            raise ValueError(f"Number of parameter snapshots ({len(param_snapshot)}) does not match number of selected parameters ({len(selected_params)})")
+        
+        for idx, param in enumerate(selected_params):
+            param.data.copy_(param_snapshot[idx].to(param.device))
 
     @staticmethod
     def apply_gradient_update(
@@ -58,12 +60,15 @@ class PairWiseEmpiricalIF:
         param_filter_fn: Callable[[str, nn.Parameter], bool],
         lr: float
     ):
-        idx = 0
-        for n, p in model.named_parameters():
-            if param_filter_fn is None or param_filter_fn(n, p):
-                grad_tensor = grad_tensors[idx].to(p.device)
-                p.data -= lr * grad_tensor
-                idx += 1
+        selected_params = selected_grad_params(model, param_filter_fn)
+        if len(grad_tensors) != len(selected_params):
+            raise ValueError(f"Number of gradient tensors ({len(grad_tensors)}) does not match number of selected parameters ({len(selected_params)})")
+        
+        for idx, param in enumerate(selected_params):
+            grad_tensor = grad_tensors[idx].to(param.device)
+            if grad_tensor.shape != param.shape:
+                raise ValueError(f"Gradient shape {grad_tensor.shape} does not match parameter shape {param.shape}")
+            param.data -= lr * grad_tensor
 
     def query_influence(
         self,

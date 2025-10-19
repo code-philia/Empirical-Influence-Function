@@ -216,6 +216,18 @@ def calc_pair_loss(
     return np.array(loss_all)
 
 
+def selected_grad_params(
+    model: nn.Module,
+    param_filter_fn: Callable[[str, nn.Parameter], bool] = None
+) -> List[torch.Tensor]:
+    named_params = list(model.named_parameters())
+    if param_filter_fn:
+        selected_params = [p for n, p in named_params if param_filter_fn(n, p) and p.requires_grad]
+    else:
+        selected_params = [p for _, p in named_params if p.requires_grad]
+    return selected_params
+
+
 def grad_pair_loss(
     model: nn.Module,
     criterion: ContrastiveLossWrapper,
@@ -226,20 +238,21 @@ def grad_pair_loss(
 ) -> List[torch.Tensor]:
     model.eval()
 
-    named_params = list(model.named_parameters())
-    if param_filter_fn:
-        selected_params = [p for n, p in named_params if param_filter_fn(n, p) and p.requires_grad]
-    else:
-        selected_params = [p for _, p in named_params if p.requires_grad]
-
+    selected_params = selected_grad_params(model, param_filter_fn)
     code_inputs = code_inputs.to(next(model.parameters()).device)
     doc_inputs = doc_inputs.to(next(model.parameters()).device)
     
     model.zero_grad()
     with torch.set_grad_enabled(True):
         loss = criterion(model, doc_inputs, code_inputs, is_positive_pair=is_positive).sum()
-        grad_this = grad(loss, selected_params, create_graph=False)
+        grad_this = grad(loss, selected_params, create_graph=False, allow_unused=True)
         
-        grad_this = [g for g in grad_this if g is not None]
-        
-    return [g.detach().cpu() for g in grad_this]
+        processed_grads = []
+        for i, g in enumerate(grad_this):
+            if g is not None:
+                processed_grads.append(g.detach().cpu())
+            else:
+                zero_grad = torch.zeros_like(selected_params[i]).detach().cpu()
+                processed_grads.append(zero_grad)
+    
+    return processed_grads
