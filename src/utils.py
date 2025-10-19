@@ -240,4 +240,6 @@ def grad_pair_loss(
         loss = criterion(model, doc_inputs, code_inputs, is_positive_pair=is_positive).sum()
         grad_this = grad(loss, selected_params, create_graph=False)
         
+        grad_this = [g for g in grad_this if g is not None]
+        
     return [g.detach().cpu() for g in grad_this]
