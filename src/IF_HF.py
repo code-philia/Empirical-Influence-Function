@@ -23,46 +23,89 @@ def list_of_dicts_to_dict_of_lists(data_list):
         "output": [d["output"] for d in data_list]
     }
 
-def process_func_with_masking(examples, tokenizer):
+
+def process_func_chatml(examples, tokenizer, max_len=MAX_LENGTH, system_message="You are a helpful assistant."):
     """
-    处理 {input, output} 格式的数据：
+    将 input/output 转换为 ChatML 格式：
+    <|im_start|>system
+    {system_message}<|im_end|>
+    <|im_start|>user
+    {input}<|im_end|>
+    <|im_start|>assistant
+    {output}<|im_end|>
+
+    并仅对 assistant 的回复部分计算 Loss。
     """
-    inputs  = examples["input"]
+    inputs = examples["input"]
     outputs = examples["output"]
 
-    new_inputs = []
+    im_start_id = tokenizer.convert_tokens_to_ids("<|im_start|>")
+    im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+    nl_tokens = tokenizer.encode("\n", add_special_tokens=False)
+
+    # 辅助函数：构建单个 Turn 的 ID 和 Label
+    def _build_turn(role, content, is_train=False):
+        # Role Header: <|im_start|>role\n
+        role_ids = [im_start_id] + tokenizer.encode(role, add_special_tokens=False) + nl_tokens
+        # Content
+        content_ids = tokenizer.encode(content, add_special_tokens=False)
+        # Footer: <|im_end|>\n
+        footer_ids = [im_end_id] + nl_tokens
+
+        # 拼接完整的 input_ids
+        full_ids = role_ids + content_ids + footer_ids
+
+        # 构建 Labels
+        if is_train:
+            # User 部分不计算 Loss (-100)
+            labels = [-100] * len(role_ids) + content_ids + footer_ids
+        else:
+            labels = [-100] * len(full_ids)
+
+        return full_ids, labels
+
+    new_input_ids = []
     new_labels = []
     new_masks = []
 
     for inp, outp in zip(inputs, outputs):
-        # 分别 Tokenize，不加特殊字符
-        inp_ids = tokenizer(inp, add_special_tokens=False).input_ids
-        out_ids = tokenizer(outp, add_special_tokens=False).input_ids + [tokenizer.eos_token_id]
+        input_ids, labels = [], []
 
-        # 拼接
-        input_ids = inp_ids + out_ids
+        sys_ids, sys_labels = _build_turn("system", system_message, is_train=False)
+        input_ids += sys_ids
+        labels += sys_labels
+
+        # --- User Turn ---
+        user_ids, user_labels = _build_turn("user", inp, is_train=False)
+        input_ids += user_ids
+        labels += user_labels
+
+        # --- Assistant Turn: output 是我们希望模型学习的内容
+        asst_ids, asst_labels = _build_turn("assistant", outp, is_train=True)
+        input_ids += asst_ids
+        labels += asst_labels
+
+        # Truncation
+        if len(input_ids) > max_len:
+            input_ids = input_ids[:max_len]
+            labels = labels[:max_len]
+
         attention_mask = [1] * len(input_ids)
 
-        # 制作 Labels：Input部分设为 -100, Output部分保留
-        labels = [-100] * len(inp_ids) + out_ids
-
-        if len(input_ids) > MAX_LENGTH:
-            input_ids = input_ids[:MAX_LENGTH]
-            attention_mask = attention_mask[:MAX_LENGTH]
-            labels = labels[:MAX_LENGTH]
-
-        padding_len = MAX_LENGTH - len(input_ids)
+        # Padding
+        padding_len = max_len - len(input_ids)
         if padding_len > 0:
-            input_ids = input_ids + [tokenizer.pad_token_id] * padding_len
+            pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else im_end_id
+            input_ids = input_ids + [pad_id] * padding_len
             attention_mask = attention_mask + [0] * padding_len
-            labels = labels + [-100] * padding_len  # Padding 部分也不算 Loss
+            labels = labels + [-100] * padding_len
 
-        new_inputs.append(input_ids)
+        new_input_ids.append(input_ids)
         new_labels.append(labels)
         new_masks.append(attention_mask)
 
     return {
-        "input_ids": torch.tensor(new_inputs),
+        "input_ids": torch.tensor(new_input_ids),
         "attention_mask": torch.tensor(new_masks),
         "labels": torch.tensor(new_labels)
     }
@@ -345,15 +388,20 @@ def main():
 
     # 处理训练集
     train_dataset = Dataset.from_dict(list_of_dicts_to_dict_of_lists(train_texts))
+
+    # 绑定 tokenizer
     process_func_partial = partial(
-        process_func_with_masking,
-        tokenizer=tokenizer
+        process_func_chatml,
+        tokenizer=tokenizer,
+        max_len=MAX_LENGTH,
+        system_message="You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
     )
+
     train_dataset = train_dataset.map(process_func_partial, batched=True, remove_columns=["input", "output"])
     train_dataset.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
     train_loader = DataLoader(train_dataset, batch_size=1, shuffle=False)
 
-    # 处理测试集 (Query)
+    # 处理测试集
     test_dataset = Dataset.from_dict(list_of_dicts_to_dict_of_lists([test_data_dict]))
     test_dataset = test_dataset.map(process_func_partial, batched=True, remove_columns=["input", "output"])
     test_dataset.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
