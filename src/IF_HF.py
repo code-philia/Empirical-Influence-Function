@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 BatchDict = Dict[str, torch.Tensor]
 ParamFilterFn = Callable[[str, nn.Parameter], bool]
 
-MAX_LENGTH = 512
+MAX_LENGTH = 8192 * 5
 
 def list_of_dicts_to_dict_of_lists(data_list):
     return {
