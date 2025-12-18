@@ -3,7 +3,8 @@ import logging
 from typing import List, Dict, Callable, Optional
 from torch import nn
 from torch.utils.data import DataLoader
-from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from transformers import AutoModelForCausalLM, AutoTokenizer, DataCollatorForSeq2Seq
 from datasets import Dataset
 from functools import partial
 
@@ -43,169 +44,136 @@ def process_func_chatml(examples, tokenizer, max_len=MAX_LENGTH, system_message=
     im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
     nl_tokens = tokenizer.encode("\n", add_special_tokens=False)
 
-    # 辅助函数：构建单个 Turn 的 ID 和 Label
     def _build_turn(role, content, is_train=False):
-        # Role Header: <|im_start|>role\n
         role_ids = [im_start_id] + tokenizer.encode(role, add_special_tokens=False) + nl_tokens
-        # Content
         content_ids = tokenizer.encode(content, add_special_tokens=False)
-        # Footer: <|im_end|>\n
         footer_ids = [im_end_id] + nl_tokens
-
-        # 拼接完整的 input_ids
         full_ids = role_ids + content_ids + footer_ids
 
-        # 构建 Labels
         if is_train:
-            # User 部分不计算 Loss (-100)
+            # -100 表示忽略计算 Loss
             labels = [-100] * len(role_ids) + content_ids + footer_ids
         else:
             labels = [-100] * len(full_ids)
-
         return full_ids, labels
 
     new_input_ids = []
     new_labels = []
-    new_masks = []
+    # 注意：不再需要手动生成 attention_mask，DataCollator 会自动处理
 
     for inp, outp in zip(inputs, outputs):
         input_ids, labels = [], []
 
+        # System
         sys_ids, sys_labels = _build_turn("system", system_message, is_train=False)
         input_ids += sys_ids
         labels += sys_labels
 
-        # --- User Turn ---
+        # User
         user_ids, user_labels = _build_turn("user", inp, is_train=False)
         input_ids += user_ids
         labels += user_labels
 
-        # --- Assistant Turn: output 是我们希望模型学习的内容
+        # Assistant
         asst_ids, asst_labels = _build_turn("assistant", outp, is_train=True)
         input_ids += asst_ids
         labels += asst_labels
 
-        # Truncation
+        # Truncation (仅截断，不 Padding)
         if len(input_ids) > max_len:
             input_ids = input_ids[:max_len]
             labels = labels[:max_len]
 
-        attention_mask = [1] * len(input_ids)
-
-        # Padding
-        padding_len = max_len - len(input_ids)
-        if padding_len > 0:
-            pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else im_end_id
-            input_ids = input_ids + [pad_id] * padding_len
-            attention_mask = attention_mask + [0] * padding_len
-            labels = labels + [-100] * padding_len
-
         new_input_ids.append(input_ids)
         new_labels.append(labels)
-        new_masks.append(attention_mask)
 
     return {
-        "input_ids": torch.tensor(new_input_ids),
-        "attention_mask": torch.tensor(new_masks),
-        "labels": torch.tensor(new_labels)
+        "input_ids": new_input_ids,
+        "labels": new_labels
     }
 
-def compute_loss_causallm(model: nn.Module, batch: BatchDict, device: torch.device) -> torch.Tensor:
-    """
-    计算 Causal LM 的 Loss. Causal LM通常是 next-token prediction，这里我让 labels=input_ids, 它内部会自动对labels做shift -1
-    """
+
+def compute_loss_per_sample(model: nn.Module, batch: BatchDict, device: torch.device) -> torch.Tensor:
+
     inputs = {
         k: v.to(device)
         for k, v in batch.items()
         if k in ['input_ids', 'attention_mask', 'labels']
     }
-    outputs = model(**inputs)
-    return outputs.loss
+
+    # 前向传播 (不自动计算 Loss)
+    outputs = model(**inputs, return_dict=True)
+    logits = outputs.logits  # [B, Seq_Len, Vocab]
+
+    # Causal LM 的预测是基于前一个 token 预测下一个，所以 logits 要左移，labels 要右移
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = inputs["labels"][..., 1:].contiguous()
+
+    # 不进行 reduction (mean/sum)
+    loss_fct = nn.CrossEntropyLoss(reduction='none', ignore_index=-100)
+
+    # [B * (Seq-1), Vocab] vs [B * (Seq-1)]
+    token_losses = loss_fct(
+        shift_logits.view(-1, shift_logits.size(-1)),
+        shift_labels.view(-1)
+    )
+
+    token_losses = token_losses.view(shift_labels.size())
+
+    valid_mask = shift_labels.ne(-100).float()
+
+    # Sum(Loss) / Count(Valid_Tokens)
+    sum_loss = (token_losses * valid_mask).sum(dim=1)
+    num_valid = valid_mask.sum(dim=1)
+
+    per_sample_loss = sum_loss / (num_valid + 1e-9)
+
+    return per_sample_loss
 
 
-def compute_gradients(
-        model: nn.Module,
-        batch: BatchDict,
-        param_filter_fn: Optional[ParamFilterFn],
-        device: torch.device
-) -> List[torch.Tensor]:
-    """
-    计算单个 Batch 针对特定参数的梯度。
-    """
+# 为了兼容 compute_gradients，保留原来的标量计算函数
+def compute_loss_scalar(model, batch, device):
+    loss_tensor = compute_loss_per_sample(model, batch, device)
+    return loss_tensor.mean()
+
+
+def compute_gradients(model, batch, param_filter_fn, device):
     model.eval()
     model.zero_grad(set_to_none=True)
+    loss = compute_loss_scalar(model, batch, device)
 
-    loss = compute_loss_causallm(model, batch, device)
+    params = [p for n, p in model.named_parameters() if
+              p.requires_grad and (param_filter_fn is None or param_filter_fn(n, p))]
+    if not params: raise ValueError("No params selected")
 
-    # 筛选参数
-    params = []
-    for name, param in model.named_parameters():
-        if param.requires_grad:
-            if param_filter_fn is None or param_filter_fn(name, param):
-                params.append(param)
-
-    if not params:
-        sample_names = [n for n, _ in list(model.named_parameters())[-10:]]
-        error_msg = (
-            "No parameters were selected for gradient computation.\n"
-            "Possible reasons:\n"
-            "1. `param_filter_fn` name matching is wrong for this model architecture.\n"
-            "2. Parameters are frozen (requires_grad=False).\n"
-            f"Last 10 layer names in model: {sample_names}"
-        )
-        logger.error(error_msg)
-        raise ValueError(error_msg)
-
-    # 计算梯度
-    grads = torch.autograd.grad(loss, params, create_graph=False)
-
-    return list(grads)
+    return list(torch.autograd.grad(loss, params))
 
 
-def calc_loss_scalar(model: nn.Module, batch: BatchDict, device: torch.device) -> float:
-    """计算 Loss 并返回 Python float"""
-    model.eval()
-    with torch.no_grad():
-        return compute_loss_causallm(model, batch, device).item()
 
-
-class BaseInfluenceFunction:
-    def __init__(
-            self,
-            dl_train: DataLoader,
-            model: nn.Module,
-            device: torch.device,
-            param_filter_fn: Optional[ParamFilterFn] = None,
-    ):
+class EmpiricalIF:
+    def __init__(self, dl_train, model, device, param_filter_fn=None):
         self.dl_train = dl_train
         self.model = model
         self.device = device
         self.param_filter_fn = param_filter_fn
 
-        # 【关键修改】不再缓存梯度，只缓存训练数据 (Data Cache)
-        # 节省显存，且速度更快
-        self.train_data_cache: List[BatchDict] = []
-        self._cache_train_data()
-        self.n_train = len(self.train_data_cache)
-
-    def _cache_train_data(self):
-        logger.info("Caching training data to CPU (for fast forward pass)...")
-        # 直接遍历 DataLoader，将 Batch 存入内存 (CPU)
+        # 缓存训练数据 (Cache)
+        self.train_batches = []
+        logger.info("Caching training data (Dynamic Padding happens here)...")
         for batch in self.dl_train:
-            # 移除不需要的 key，只保留 Tensor 并移至 CPU
-            batch_cpu = {
-                k: v.cpu()
-                for k, v in batch.items()
-                if isinstance(v, torch.Tensor)
-            }
-            self.train_data_cache.append(batch_cpu)
-        logger.info(f"Cached {len(self.train_data_cache)} training samples.")
+            self.train_batches.append(batch)
 
-    def query_influence(self, query_batch: BatchDict) -> List[float]:
-        raise NotImplementedError
+        self.n_samples = sum(len(b['input_ids']) for b in self.train_batches)
+        logger.info(f"Cached {len(self.train_batches)} batches, total {self.n_samples} samples.")
 
+    def _get_train_losses(self) -> torch.Tensor:
+        all_losses = []
+        with torch.no_grad():
+            for batch in self.train_batches:
+                batch_loss = compute_loss_per_sample(self.model, batch, self.device)
+                all_losses.append(batch_loss.cpu())  # 存回 CPU
+        return torch.cat(all_losses)  # [N_Train]
 
-class EmpiricalIF(BaseInfluenceFunction):
     @staticmethod
     def get_param_snapshot(model: nn.Module, param_filter_fn: Optional[ParamFilterFn]) -> List[torch.Tensor]:
         snapshot = []
@@ -255,11 +223,8 @@ class EmpiricalIF(BaseInfluenceFunction):
 
         # 2. 计算 Base Loss (L_test, L_train) - 更新前
         logger.info("Calculating Base Losses...")
-        l_test_base = calc_loss_scalar(self.model, query_batch, self.device)
-
-        l_train_base_list = []
-        for train_batch in self.train_data_cache:
-            l_train_base_list.append(calc_loss_scalar(self.model, train_batch, self.device))
+        l_test_base = compute_loss_scalar(self.model, query_batch, self.device).item()
+        l_train_base = self._get_train_losses()  # Vector [N]
 
         # 备份参数
         snapshot = self.get_param_snapshot(self.model, self.param_filter_fn)
@@ -270,13 +235,8 @@ class EmpiricalIF(BaseInfluenceFunction):
         self.apply_gradient_update(self.model, test_grads, self.param_filter_fn, lr=lr)
 
         # L_test'
-        l_test_descent = calc_loss_scalar(self.model, query_batch, self.device)
-        delta_test_descent = l_test_descent - l_test_base  # 通常应该是负数
-
-        # L_train' (遍历所有训练样本)
-        l_train_descent_list = []
-        for train_batch in self.train_data_cache:
-            l_train_descent_list.append(calc_loss_scalar(self.model, train_batch, self.device))
+        l_test_des = compute_loss_scalar(self.model, query_batch, self.device).item()
+        l_train_des = self._get_train_losses()  # Vector [N]
 
         # 恢复参数
         self.restore_params(self.model, snapshot, self.param_filter_fn)
@@ -287,38 +247,29 @@ class EmpiricalIF(BaseInfluenceFunction):
         self.apply_gradient_update(self.model, test_grads, self.param_filter_fn, lr=-lr)
 
         # L_test''
-        l_test_ascent = calc_loss_scalar(self.model, query_batch, self.device)
-        delta_test_ascent = l_test_ascent - l_test_base  # 通常应该是正数
-
-        # L_train'' (遍历所有训练样本)
-        l_train_ascent_list = []
-        for train_batch in self.train_data_cache:
-            l_train_ascent_list.append(calc_loss_scalar(self.model, train_batch, self.device))
+        l_test_asc = compute_loss_scalar(self.model, query_batch, self.device).item()
+        l_train_asc = self._get_train_losses()  # Vector [N]
 
         # 恢复参数
         self.restore_params(self.model, snapshot, self.param_filter_fn)
 
         # Final Score Calculation
         logger.info("Computing final scores...")
-        influences = []
 
-        # 遍历每个训练样本进行计算
-        for i in range(self.n_train):
-            # Term 1: Descent Component
-            # (L_test' - L_test) * (L_train' - L_train)
-            delta_train_descent = l_train_descent_list[i] - l_train_base_list[i]
-            term_1 = delta_test_descent * delta_train_descent
+        # Scalar deltas
+        delta_test_des = l_test_des - l_test_base
+        delta_test_asc = l_test_asc - l_test_base
 
-            # Term 2: Ascent Component
-            # (L_test'' - L_test) * (L_train'' - L_train)
-            delta_train_ascent = l_train_ascent_list[i] - l_train_base_list[i]
-            term_2 = delta_test_ascent * delta_train_ascent
+        # Vector deltas [N]
+        delta_train_des = l_train_des - l_train_base
+        delta_train_asc = l_train_asc - l_train_base
 
-            # Average
-            score = (term_1 + term_2) / 2
-            influences.append(score)
+        # Term 1 & 2
+        term_1 = delta_test_des * delta_train_des
+        term_2 = delta_test_asc * delta_train_asc
 
-        return influences
+        scores = (term_1 + term_2) / 2
+        return scores.tolist()
 
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -386,48 +337,45 @@ def main():
             "output": "import torch\nx = torch.randn(10)"
     }
 
-    # 处理训练集
-    train_dataset = Dataset.from_dict(list_of_dicts_to_dict_of_lists(train_texts))
-
-    # 绑定 tokenizer
-    process_func_partial = partial(
-        process_func_chatml,
+    data_collator = DataCollatorForSeq2Seq(
         tokenizer=tokenizer,
-        max_len=MAX_LENGTH,
-        system_message="You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
+        model=model,
+        padding=True,  # 启用动态 Padding
+        label_pad_token_id=-100
     )
 
-    train_dataset = train_dataset.map(process_func_partial, batched=True, remove_columns=["input", "output"])
-    train_dataset.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
-    train_loader = DataLoader(train_dataset, batch_size=1, shuffle=False)
+    process_func = partial(process_func_chatml, tokenizer=tokenizer)
 
-    # 处理测试集
-    test_dataset = Dataset.from_dict(list_of_dicts_to_dict_of_lists([test_data_dict]))
-    test_dataset = test_dataset.map(process_func_partial, batched=True, remove_columns=["input", "output"])
-    test_dataset.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
+    # Train Dataset
+    train_ds = Dataset.from_dict(list_of_dicts_to_dict_of_lists(train_texts))
+    train_ds = train_ds.map(process_func, batched=True, remove_columns=["input", "output"])
 
-    # 提取 Tensor 字典
-    query_batch = {
-        "input_ids": test_dataset[0]["input_ids"].unsqueeze(0).to(device),
-        "attention_mask": test_dataset[0]["attention_mask"].unsqueeze(0).to(device),
-        "labels": test_dataset[0]["labels"].unsqueeze(0).to(device)
-    }
+    BATCH_SIZE = 3  # 根据显存调整，如果显存够大，可以设为 4, 8, 16
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        collate_fn=data_collator  # 使用 collator
+    )
 
-    # 运行 Influence Function
-    def filter_params(name: str, param: nn.Parameter) -> bool:
-        return target_layer_keyword in name and param.requires_grad
+    # Test Dataset (Query)
+    test_ds = Dataset.from_dict(list_of_dicts_to_dict_of_lists([test_data_dict]))
+    test_ds = test_ds.map(process_func, batched=True, remove_columns=["input", "output"])
+    # Query 只有一个样本，BatchSize=1 即可
+    query_batch = data_collator([test_ds[0]])
+    for k, v in query_batch.items():
+        query_batch[k] = v.to(device)
 
-    logger.info("Initializing Empirical IF...")
-    eif = EmpiricalIF(dl_train=train_loader, model=model, device=device, param_filter_fn=filter_params)
+    # 运行优化后的 IF
+    def filter_params(n, p):
+        return target_layer_keyword in n and p.requires_grad
 
-    logger.info("Querying influence...")
+    eif = EmpiricalIF(train_loader, model, device, filter_params)
     scores = eif.query_influence(query_batch, lr=1e-4)
 
     logger.info("Results:")
-    # 打印结果时，只截取 output 的前几十个字符展示
     for i, score in enumerate(scores):
-        preview = train_texts[i]['output'].replace('\n', '\\n')[:50]
-        print(f"Sample {i} | Score: {score:.6f} | Output: {preview}...")
+        print(f"Sample {i} | Score: {score:.6e}")
 
 
 if __name__ == '__main__':
