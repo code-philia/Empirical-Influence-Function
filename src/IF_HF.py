@@ -7,6 +7,10 @@ from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer, DataCollatorForSeq2Seq
 from datasets import Dataset
 from functools import partial
+from accelerate import Accelerator
+from accelerate.utils import set_seed
+import json
+from tqdm import tqdm
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -16,7 +20,7 @@ logger = logging.getLogger(__name__)
 BatchDict = Dict[str, torch.Tensor]
 ParamFilterFn = Callable[[str, nn.Parameter], bool]
 
-MAX_LENGTH = 8192 * 5
+MAX_LENGTH = 2048
 
 def list_of_dicts_to_dict_of_lists(data_list):
     return {
@@ -151,28 +155,45 @@ def compute_gradients(model, batch, param_filter_fn, device):
 
 
 class EmpiricalIF:
-    def __init__(self, dl_train, model, device, param_filter_fn=None):
+    def __init__(self, dl_train, model, accelerator, param_filter_fn=None):
         self.dl_train = dl_train
         self.model = model
-        self.device = device
+        self.accelerator = accelerator  # 传入 accelerator 实例
+        self.device = accelerator.device
         self.param_filter_fn = param_filter_fn
 
         # 缓存训练数据 (Cache)
         self.train_batches = []
-        logger.info("Caching training data (Dynamic Padding happens here)...")
+        if self.accelerator.is_main_process:
+            logger.info("Caching training data (distributed shards)...")
         for batch in self.dl_train:
-            self.train_batches.append(batch)
+            # 移回 CPU 节省显存，计算时再挪到 GPU
+            batch_cpu = {k: v.cpu() for k, v in batch.items() if isinstance(v, torch.Tensor)}
+            self.train_batches.append(batch_cpu)
 
-        self.n_samples = sum(len(b['input_ids']) for b in self.train_batches)
-        logger.info(f"Cached {len(self.train_batches)} batches, total {self.n_samples} samples.")
+        local_count = sum(len(b['input_ids']) for b in self.train_batches)
+        logger.info(
+            f"[Rank {self.accelerator.process_index}] Cached {len(self.train_batches)} batches ({local_count} samples).")
 
     def _get_train_losses(self) -> torch.Tensor:
+        """计算当前 GPU 上分片的 Loss"""
         all_losses = []
+        all_indices = []
         with torch.no_grad():
-            for batch in self.train_batches:
-                batch_loss = compute_loss_per_sample(self.model, batch, self.device)
-                all_losses.append(batch_loss.cpu())  # 存回 CPU
-        return torch.cat(all_losses)  # [N_Train]
+            for batch in tqdm(self.train_batches, desc="Computing training loss"):
+                batch_gpu = {k: v.to(self.device) for k, v in batch.items()}
+
+                # 计算 Loss
+                batch_loss = compute_loss_per_sample(self.model, batch_gpu, self.device)
+
+                # 收集 Loss 和 Index
+                all_losses.append(batch_loss)
+                all_indices.append(batch_gpu["sample_index"])  # 获取 index
+
+        if not all_losses:
+            return torch.tensor([]).to(self.device), torch.tensor([]).to(self.device)
+
+        return torch.cat(all_losses), torch.cat(all_indices)
 
     @staticmethod
     def get_param_snapshot(model: nn.Module, param_filter_fn: Optional[ParamFilterFn]) -> List[torch.Tensor]:
@@ -218,43 +239,48 @@ class EmpiricalIF:
         """
 
         # 1. 计算 Test Sample 的梯度 (Perturbation Source)
-        logger.info("Computing gradient for query (test) sample...")
+        if self.accelerator.is_main_process:
+            logger.info("Computing gradient for query...")
         test_grads = compute_gradients(self.model, query_batch, self.param_filter_fn, self.device)
 
         # 2. 计算 Base Loss (L_test, L_train) - 更新前
-        logger.info("Calculating Base Losses...")
+        if self.accelerator.is_main_process:
+            logger.info("Calculating Base Losses...")
         l_test_base = compute_loss_scalar(self.model, query_batch, self.device).item()
-        l_train_base = self._get_train_losses()  # Vector [N]
+        l_train_base, indices_local = self._get_train_losses()  # Vector [N]
 
         # 备份参数
         snapshot = self.get_param_snapshot(self.model, self.param_filter_fn)
 
         # Part A: Descent on Test (L')
-        logger.info("Step A: Descent on Test Gradient...")
+        if self.accelerator.is_main_process:
+            logger.info("Step A: Descent on Test Gradient...")
         # Theta' = Theta - lr * Test_Grad
         self.apply_gradient_update(self.model, test_grads, self.param_filter_fn, lr=lr)
 
         # L_test'
         l_test_des = compute_loss_scalar(self.model, query_batch, self.device).item()
-        l_train_des = self._get_train_losses()  # Vector [N]
+        l_train_des, _ = self._get_train_losses()  # Vector [N]
 
         # 恢复参数
         self.restore_params(self.model, snapshot, self.param_filter_fn)
 
         # Part B: Ascent on Test (L'')
-        logger.info("Step B: Ascent on Test Gradient...")
+        if self.accelerator.is_main_process:
+            logger.info("Step B: Ascent on Test Gradient...")
         # Theta'' = Theta + lr * Test_Grad (即 lr = -lr)
         self.apply_gradient_update(self.model, test_grads, self.param_filter_fn, lr=-lr)
 
         # L_test''
         l_test_asc = compute_loss_scalar(self.model, query_batch, self.device).item()
-        l_train_asc = self._get_train_losses()  # Vector [N]
+        l_train_asc, _ = self._get_train_losses()  # Vector [N]
 
         # 恢复参数
         self.restore_params(self.model, snapshot, self.param_filter_fn)
 
         # Final Score Calculation
-        logger.info("Computing final scores...")
+        if self.accelerator.is_main_process:
+            logger.info("Computing final scores and gathering...")
 
         # Scalar deltas
         delta_test_des = l_test_des - l_test_base
@@ -264,73 +290,59 @@ class EmpiricalIF:
         delta_train_des = l_train_des - l_train_base
         delta_train_asc = l_train_asc - l_train_base
 
-        # Term 1 & 2
-        term_1 = delta_test_des * delta_train_des
-        term_2 = delta_test_asc * delta_train_asc
-
-        scores = (term_1 + term_2) / 2
-        return scores.tolist()
+        local_scores = ((delta_test_des * delta_train_des) + (delta_test_asc * delta_train_asc)) / 2
+        all_scores  = self.accelerator.gather(local_scores)
+        all_indices = self.accelerator.gather(indices_local)
+        return all_scores.tolist(), all_indices.tolist()
 
 def main():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"Using device: {device}")
+    accelerator = Accelerator()
 
-    # 模型加载 (Qwen2.5-Coder-1.5B)
+    # 确保随机种子一致，保证模型初始化一致（虽然这里加载的是预训练模型，但是一个好习惯）
+    set_seed(42)
+
+    if accelerator.is_main_process:
+        logger.info(f"Using distributed mode: {accelerator.state.num_processes} GPUs")
+
     model_id = "Qwen/Qwen2.5-Coder-1.5B-Instruct"
-    logger.info(f"Loading model: {model_id}")
-
     try:
         tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+
+        # 加载到特定 device
         model = AutoModelForCausalLM.from_pretrained(
             model_id,
-            device_map="auto",
-            torch_dtype="auto",
+            device_map={"": accelerator.device},  # 显式指定映射到当前加速器的设备
+            torch_dtype=torch.bfloat16,
             trust_remote_code=True
         )
     except Exception as e:
-        logger.error(f"Error loading model via AutoModel: {e}")
+        logger.error(f"Error: {e}")
         return
 
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    if hasattr(model, "device"):
-        device = model.device
-
     target_layer_keyword = "model.layers.27.mlp"
-    logger.info(f"Enabling gradients for layers matching: '{target_layer_keyword}'")
-    # 先冻结所有参数
+    if accelerator.is_main_process:
+        logger.info(f"Unfreezing layers: '{target_layer_keyword}'")
+    # 先冻结所有参数 仅解冻目标层
     for param in model.parameters():
         param.requires_grad = False
-    # 仅解冻目标层
-    unfrozen_count = 0
     for name, param in model.named_parameters():
         if target_layer_keyword in name:
             param.requires_grad = True
-            unfrozen_count += 1
-    logger.info(f"Total parameters unfrozen: {unfrozen_count}")
-
-    if unfrozen_count == 0:
-        logger.error(f"Failed to find any layers matching '{target_layer_keyword}'. Check model structure.")
-        return
 
     # ==========================================
     # 准备代码相关数据
     # ==========================================
-    train_texts = [
-        {
-            "input":  "This is a go programming task on some code contents. Given task: The task is to fill in the missing part of a go function according to the provided code   content. Below is the package path:github.com/urfave/cli Below is the code repository: github.com/urfave/cli/ Below is the imported package path \"fmt\"; \"time\" The receiver struct definitions of the function is type stringSliceArgs struct {\n\tv []string\n}\n\n// Methods:\n- func (a *stringSliceArgs) Get(n int) string\n- func (a *stringSliceArgs) First() string\n- func (a *stringSliceArgs) Tail() *ast.ArrayType\n- func (a *stringSliceArgs) Len() int\n- func (a *stringSliceArgs) Present() bool\n- func (a *stringSliceArgs) Slice() *ast.ArrayType\n The parameter struct definition or not exist of the function is not exist The return value struct definitions or not exist of the function is *ast.ArrayType The code snippets before the function is func (a *stringSliceArgs) Get(n int) string {\n\tif len(a.v) > n {\n\t\treturn a.v[n]\n\t}\n\treturn \"\"\n}\n\nfunc (a *stringSliceArgs) First() string {\n\treturn a.Get(0)\n} And here is the function you are asked to complete func (a *stringSliceArgs) Tail() *ast.ArrayType\nfunc (a *stringSliceArgs) Tail() []string {\n\tif a.Len() >= 2 { <MID> \t}\n\n\treturn []string{}\n} Ensure that only missing codes marked as <MID> are returned. ",
-            "output": "\t\ttail := a.v[1:]\n\t\tret := make([]string, len(tail))\n\t\tcopy(ret, tail)\n\t\treturn ret",
-        },
-        {
-            "input": "The quick brown fox jumps over the lazy dog.",
-            "output": "\t\ttail := a.v[1:]\n\t\tret := make([]string, len(tail))\n\t\tcopy(ret, tail)\n\t\treturn ret",
-        },
-        {
-            "input": "class MyDataset(Dataset): pass",
-            "output": "import torch\nx = torch.randn(10)",
-        }
-    ]
+    train_texts = []
+    with open("../perturbed.jsonl", 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            obj = json.loads(line)
+            if len(obj['messages'][2]['content']) > 0:
+                train_texts.append({'input': obj['messages'][1]['content'], 'output': obj['messages'][2]['content']})
 
     test_data_dict =  {
             "input":  "This is a go programming task on some code contents. Given task: The task is to fill in the missing part of a go function according to the provided code   content. Below is the package path:github.com/urfave/cli Below is the code repository: github.com/urfave/cli/ Below is the imported package path \"fmt\"; \"time\" The receiver struct definitions of the function is type stringSliceArgs struct {\n\tv []string\n}\n\n// Methods:\n- func (a *stringSliceArgs) Get(n int) string\n- func (a *stringSliceArgs) First() string\n- func (a *stringSliceArgs) Tail() *ast.ArrayType\n- func (a *stringSliceArgs) Len() int\n- func (a *stringSliceArgs) Present() bool\n- func (a *stringSliceArgs) Slice() *ast.ArrayType\n The parameter struct definition or not exist of the function is not exist The return value struct definitions or not exist of the function is *ast.ArrayType The code snippets before the function is func (a *stringSliceArgs) Get(n int) string {\n\tif len(a.v) > n {\n\t\treturn a.v[n]\n\t}\n\treturn \"\"\n}\n\nfunc (a *stringSliceArgs) First() string {\n\treturn a.Get(0)\n} And here is the function you are asked to complete func (a *stringSliceArgs) Tail() *ast.ArrayType\nfunc (a *stringSliceArgs) Tail() []string {\n\tif a.Len() >= 2 { <MID> \t}\n\n\treturn []string{}\n} Ensure that only missing codes marked as <MID> are returned. ",
@@ -344,13 +356,19 @@ def main():
         label_pad_token_id=-100
     )
 
-    process_func = partial(process_func_chatml, tokenizer=tokenizer)
+    process_func = partial(
+        process_func_chatml,
+        tokenizer=tokenizer,
+        system_message="You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
+    )
 
     # Train Dataset
     train_ds = Dataset.from_dict(list_of_dicts_to_dict_of_lists(train_texts))
+    train_ds = train_ds.map(lambda x, i: {"sample_index": i}, with_indices=True)
     train_ds = train_ds.map(process_func, batched=True, remove_columns=["input", "output"])
+    train_ds.set_format(type="torch", columns=["input_ids", "labels", "sample_index"])
 
-    BATCH_SIZE = 3  # 根据显存调整，如果显存够大，可以设为 4, 8, 16
+    BATCH_SIZE = 8  # 根据显存调整，如果显存够大，可以设为 4, 8, 16
     train_loader = DataLoader(
         train_ds,
         batch_size=BATCH_SIZE,
@@ -361,22 +379,38 @@ def main():
     # Test Dataset (Query)
     test_ds = Dataset.from_dict(list_of_dicts_to_dict_of_lists([test_data_dict]))
     test_ds = test_ds.map(process_func, batched=True, remove_columns=["input", "output"])
-    # Query 只有一个样本，BatchSize=1 即可
+
+    # 使用 Accelerator 准备 DataLoader
+    train_loader = accelerator.prepare(train_loader)
+
     query_batch = data_collator([test_ds[0]])
     for k, v in query_batch.items():
-        query_batch[k] = v.to(device)
+        query_batch[k] = v.to(accelerator.device)
 
     # 运行优化后的 IF
     def filter_params(n, p):
         return target_layer_keyword in n and p.requires_grad
 
-    eif = EmpiricalIF(train_loader, model, device, filter_params)
-    scores = eif.query_influence(query_batch, lr=1e-4)
+    eif = EmpiricalIF(train_loader, model, accelerator, filter_params)
+    scores, indices = eif.query_influence(query_batch, lr=1e-4)
 
-    logger.info("Results:")
-    for i, score in enumerate(scores):
-        print(f"Sample {i} | Score: {score:.6e}")
+    if accelerator.is_main_process:
+        logger.info(f"Total scores computed: {len(scores)}")
+        results = list(zip(scores, indices))
+        results.sort(key=lambda x: x[0], reverse=True)
+
+        logger.info("Top 5 Most Influential Samples:")
+        for rank, (score, original_idx) in enumerate(results[:5]):
+            sample_content = train_texts[original_idx]
+
+            print(f"\n=== Rank {rank} | Score: {score:.6e} | ID: {original_idx} ===")
+            print(f"[Input]: {sample_content['input'][:100]}...")  # 只打印前100字符防止刷屏
+            print(f"[Output]: {sample_content['output'][:100]}...")
 
 
 if __name__ == '__main__':
     main()
+
+    # pip install accelerate
+    # accelerate config
+    # CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 accelerate launch --num_processes 8 IF_HF.py
