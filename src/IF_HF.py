@@ -12,6 +12,8 @@ from accelerate.utils import set_seed
 import json
 from tqdm import tqdm
 import re
+import os
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -122,6 +124,8 @@ def compute_loss_per_sample(model: nn.Module, batch: BatchDict, device: torch.de
     # 前向传播 (不自动计算 Loss)
     outputs = model(**inputs, return_dict=True)
     logits = outputs.logits  # [B, Seq_Len, Vocab]
+
+    logits = logits.float()
 
     # Causal LM 的预测是基于前一个 token 预测下一个，所以 logits 要左移，labels 要右移
     shift_logits = logits[..., :-1, :].contiguous()
@@ -315,6 +319,9 @@ class EmpiricalIF:
         return all_scores.tolist(), all_indices.tolist()
 
 def main():
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    torch.use_deterministic_algorithms(True)
     accelerator = Accelerator()
 
     # 确保随机种子一致，保证模型初始化一致（虽然这里加载的是预训练模型，但是一个好习惯）
@@ -340,7 +347,7 @@ def main():
         logger.error(f"Error: {e}")
         return
 
-    target_layer_keyword = "model.layers.0"
+    target_layer_keyword = "model.layers"
     if accelerator.is_main_process:
         logger.info(f"Unfreezing layers: '{target_layer_keyword}'")
     # 先冻结所有参数 仅解冻目标层
@@ -389,7 +396,7 @@ def main():
     train_ds = train_ds.map(process_func, batched=True, remove_columns=["input", "output"])
     train_ds.set_format(type="torch", columns=["input_ids", "labels", "sample_index"])
 
-    BATCH_SIZE = 8  # 根据显存调整，如果显存够大，可以设为 4, 8, 16
+    BATCH_SIZE = 2  # 根据显存调整，如果显存够大，可以设为 4, 8, 16
     train_loader = DataLoader(
         train_ds,
         batch_size=BATCH_SIZE,
@@ -443,6 +450,20 @@ def main():
         print(f"\n" + "=" * 50)
         print(f"SELF-Rank:  {self_rank} / {len(results)}")
         print(f"SELF-Score: {self_score:.6e}")
+
+        # query_target_id = 1  # 因为 test_data_dict = train_texts[0]
+        # self_rank = -1
+        # self_score = 0.0
+        #
+        # for rank, (score, idx) in enumerate(results):
+        #     if idx == query_target_id:
+        #         self_rank = rank
+        #         self_score = score
+        #         break
+        #
+        # print(f"\n" + "=" * 50)
+        # print(f"SELF-Rank (same output):  {self_rank} / {len(results)}")
+        # print(f"SELF-Score (same output): {self_score:.6e}")
 
         # 打印 Top 5
         for rank, (score, original_idx) in enumerate(results[:5]):
