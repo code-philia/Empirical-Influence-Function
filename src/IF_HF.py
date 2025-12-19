@@ -11,6 +11,7 @@ from accelerate import Accelerator
 from accelerate.utils import set_seed
 import json
 from tqdm import tqdm
+import re
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -28,6 +29,19 @@ def list_of_dicts_to_dict_of_lists(data_list):
         "output": [d["output"] for d in data_list]
     }
 
+
+def extract_code_content(text):
+    text = text.replace("This is a go programming task on some code contents. Given task: The task is to fill in the missing part of a go function according to the provided code   content. ", "")
+    pattern = r"The code snippets before the function is\s*([\s\S]*?)\s*Ensure that only missing codes marked as <MID> are returned"
+
+    match = re.search(pattern, text)
+
+    if match:
+        # Return only the captured group (the code)
+        return match.group(1).strip()
+    else:
+        # Fallback: return original text or handle error if format doesn't match
+        return text
 
 def process_func_chatml(examples, tokenizer, max_len=MAX_LENGTH, system_message="You are a helpful assistant."):
     """
@@ -179,8 +193,13 @@ class EmpiricalIF:
         """计算当前 GPU 上分片的 Loss"""
         all_losses = []
         all_indices = []
+
+        self.model.eval()
+
         with torch.no_grad():
             for batch in tqdm(self.train_batches, desc="Computing training loss"):
+                if "sample_index" not in batch:
+                    raise ValueError("sample_index 被 DataCollator 丢掉了！请检查 collate_fn。")
                 batch_gpu = {k: v.to(self.device) for k, v in batch.items()}
 
                 # 计算 Loss
@@ -309,7 +328,7 @@ def main():
         tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
-
+        tokenizer.padding_side = "right"  # 显式指定右侧 Padding
         # 加载到特定 device
         model = AutoModelForCausalLM.from_pretrained(
             model_id,
@@ -321,7 +340,7 @@ def main():
         logger.error(f"Error: {e}")
         return
 
-    target_layer_keyword = "model.layers.27.mlp"
+    target_layer_keyword = "model.layers.0"
     if accelerator.is_main_process:
         logger.info(f"Unfreezing layers: '{target_layer_keyword}'")
     # 先冻结所有参数 仅解冻目标层
@@ -335,19 +354,21 @@ def main():
     # 准备代码相关数据
     # ==========================================
     train_texts = []
-    with open("../perturbed.jsonl", 'r', encoding='utf-8') as f:
+    with open("../perturbed_small_data.jsonl", 'r', encoding='utf-8') as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
             obj = json.loads(line)
             if len(obj['messages'][2]['content']) > 0:
-                train_texts.append({'input': obj['messages'][1]['content'], 'output': obj['messages'][2]['content']})
+                input = extract_code_content(obj['messages'][1]['content'])
+                train_texts.append({
+                    'input': input,
+                    'output': obj['messages'][2]['content']
+                })
 
-    test_data_dict =  {
-            "input":  "This is a go programming task on some code contents. Given task: The task is to fill in the missing part of a go function according to the provided code   content. Below is the package path:github.com/urfave/cli Below is the code repository: github.com/urfave/cli/ Below is the imported package path \"fmt\"; \"time\" The receiver struct definitions of the function is type stringSliceArgs struct {\n\tv []string\n}\n\n// Methods:\n- func (a *stringSliceArgs) Get(n int) string\n- func (a *stringSliceArgs) First() string\n- func (a *stringSliceArgs) Tail() *ast.ArrayType\n- func (a *stringSliceArgs) Len() int\n- func (a *stringSliceArgs) Present() bool\n- func (a *stringSliceArgs) Slice() *ast.ArrayType\n The parameter struct definition or not exist of the function is not exist The return value struct definitions or not exist of the function is *ast.ArrayType The code snippets before the function is func (a *stringSliceArgs) Get(n int) string {\n\tif len(a.v) > n {\n\t\treturn a.v[n]\n\t}\n\treturn \"\"\n}\n\nfunc (a *stringSliceArgs) First() string {\n\treturn a.Get(0)\n} And here is the function you are asked to complete func (a *stringSliceArgs) Tail() *ast.ArrayType\nfunc (a *stringSliceArgs) Tail() []string {\n\tif a.Len() >= 2 { <MID> \t}\n\n\treturn []string{}\n} Ensure that only missing codes marked as <MID> are returned. ",
-            "output": "import torch\nx = torch.randn(10)"
-    }
+    test_data_dict =  train_texts[0]
+    test_data_dict["output"] = train_texts[1]["output"]
 
     data_collator = DataCollatorForSeq2Seq(
         tokenizer=tokenizer,
@@ -395,20 +416,45 @@ def main():
     scores, indices = eif.query_influence(query_batch, lr=1e-4)
 
     if accelerator.is_main_process:
-        logger.info(f"Total scores computed: {len(scores)}")
-        results = list(zip(scores, indices))
+        print(f"[Query Input]: {test_data_dict}...")
+
+        # DistributedSampler 可能会 pad 数据，导致有重复 index
+        unique_results = {}
+        for s, idx in zip(scores, indices):
+            # idx 是 float/tensor 转过来的，可能是 float，转 int
+            idx = int(idx)
+            unique_results[idx] = s
+
+        # 还原回列表并排序
+        results = [(score, idx) for idx, score in unique_results.items()]
         results.sort(key=lambda x: x[0], reverse=True)
+        logger.info(f"Unique scores computed: {len(results)}")
 
-        logger.info("Top 5 Most Influential Samples:")
+        query_target_id = 0  # 因为 test_data_dict = train_texts[0]
+        self_rank = -1
+        self_score = 0.0
+
+        for rank, (score, idx) in enumerate(results):
+            if idx == query_target_id:
+                self_rank = rank
+                self_score = score
+                break
+
+        print(f"\n" + "=" * 50)
+        print(f"SELF-Rank:  {self_rank} / {len(results)}")
+        print(f"SELF-Score: {self_score:.6e}")
+
+        # 打印 Top 5
         for rank, (score, original_idx) in enumerate(results[:5]):
-            sample_content = train_texts[original_idx]
-
-            print(f"\n=== Rank {rank} | Score: {score:.6e} | ID: {original_idx} ===")
-            print(f"[Input]: {sample_content['input'][:100]}...")  # 只打印前100字符防止刷屏
-            print(f"[Output]: {sample_content['output'][:100]}...")
+            if original_idx < len(train_texts):
+                sample_content = train_texts[original_idx]
+                print(f"\n=== Rank {rank} | Score: {score:.6e} | ID: {original_idx} ===")
+                print(f"[Input]: {sample_content['input'][:100]}...")  # 只打印前100字符防止刷屏
 
 
 if __name__ == '__main__':
+
+
     main()
 
     # pip install accelerate
