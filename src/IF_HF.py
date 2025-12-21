@@ -272,7 +272,7 @@ class EmpiricalIF:
                         param.data -= lr * grad_device
                     idx += 1
 
-    def query_influence(self, query_batch: BatchDict, lr: float = 1e-4, max_steps: int = 1000, loss_threshold: float = 0.1) -> List[float]:
+    def query_influence(self, query_batch: BatchDict, lr: float = 1e-2, max_steps: int = 1000, loss_threshold: float = 1e-4) -> List[float]:
         """
         Implementation of:
         Term 1: (L_test' - L_test) * (L_train' - L_train)  [from Test Descent]
