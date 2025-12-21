@@ -1,6 +1,6 @@
 import torch
 import logging
-from typing import List, Dict, Callable, Optional
+from typing import List, Dict, Callable, Optional, Any
 from torch import nn
 from torch.utils.data import DataLoader
 
@@ -13,6 +13,7 @@ import json
 from tqdm import tqdm
 import re
 import os
+import numpy as np
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
 # 配置日志
@@ -23,7 +24,6 @@ logger = logging.getLogger(__name__)
 BatchDict = Dict[str, torch.Tensor]
 ParamFilterFn = Callable[[str, nn.Parameter], bool]
 
-MAX_LENGTH = 2048
 
 def list_of_dicts_to_dict_of_lists(data_list):
     return {
@@ -34,35 +34,34 @@ def list_of_dicts_to_dict_of_lists(data_list):
 
 def extract_code_content(text):
     text = text.replace("This is a go programming task on some code contents. Given task: The task is to fill in the missing part of a go function according to the provided code   content. ", "")
-    pattern = r"The code snippets before the function is\s*([\s\S]*?)\s*Ensure that only missing codes marked as <MID> are returned"
+    pattern = r"And here is the function you are asked to complete\s*([\s\S]*) Ensure that only missing codes marked as <MID> are returned"
 
     match = re.search(pattern, text)
 
     if match:
-        # Return only the captured group (the code)
-        return match.group(1).strip()
+        extracted_part = match.group(1)
+        return extracted_part
     else:
-        # Fallback: return original text or handle error if format doesn't match
         return text
 
-def process_func_chatml(examples, tokenizer, max_len=MAX_LENGTH, system_message="You are a helpful assistant."):
+
+def process_func_chatml(examples, tokenizer, max_len=2048, system_message="You are a helpful assistant."):
     """
     将 input/output 转换为 ChatML 格式：
-    <|im_start|>system
-    {system_message}<|im_end|>
-    <|im_start|>user
-    {input}<|im_end|>
-    <|im_start|>assistant
-    {output}<|im_end|>
-
+        <|im_start|>system
+        {system_message}<|im_end|>
+        <|im_start|>user
+        {input}<|im_end|>
+        <|im_start|>assistant
+        {output}<|im_end|>
     并仅对 assistant 的回复部分计算 Loss。
     """
-    inputs = examples["input"]
+    inputs  = examples["input"]
     outputs = examples["output"]
 
     im_start_id = tokenizer.convert_tokens_to_ids("<|im_start|>")
-    im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
-    nl_tokens = tokenizer.encode("\n", add_special_tokens=False)
+    im_end_id  = tokenizer.convert_tokens_to_ids("<|im_end|>")
+    nl_tokens  = tokenizer.encode("\n", add_special_tokens=False)
 
     def _build_turn(role, content, is_train=False):
         role_ids = [im_start_id] + tokenizer.encode(role, add_special_tokens=False) + nl_tokens
@@ -113,6 +112,23 @@ def process_func_chatml(examples, tokenizer, max_len=MAX_LENGTH, system_message=
     }
 
 
+class CustomCollator:
+    def __init__(self, base_collator):
+        self.base_collator = base_collator
+
+    def __call__(self, features: List[Dict[str, Any]]) -> BatchDict:
+        indices = []
+        for f in features:
+            if "sample_index" in f:
+                indices.append(f.pop("sample_index"))
+
+        batch = self.base_collator(features)
+
+        if indices:
+            batch["sample_index"] = torch.tensor(indices, dtype=torch.long)
+
+        return batch
+
 def compute_loss_per_sample(model: nn.Module, batch: BatchDict, device: torch.device) -> torch.Tensor:
 
     inputs = {
@@ -160,16 +176,19 @@ def compute_loss_scalar(model, batch, device):
 
 
 def compute_gradients(model, batch, param_filter_fn, device):
-    model.eval()
+    model.eval()  # 保持 eval 模式，我们手动计算梯度
     model.zero_grad(set_to_none=True)
-    loss = compute_loss_scalar(model, batch, device)
 
-    params = [p for n, p in model.named_parameters() if
-              p.requires_grad and (param_filter_fn is None or param_filter_fn(n, p))]
-    if not params: raise ValueError("No params selected")
+    # Enable grad computation even in eval mode
+    with torch.set_grad_enabled(True):
+        loss = compute_loss_scalar(model, batch, device)
+        params = [p for n, p in model.named_parameters() if
+                  p.requires_grad and (param_filter_fn is None or param_filter_fn(n, p))]
+        if not params:
+            raise ValueError("No params selected for gradient computation")
+        grads = torch.autograd.grad(loss, params)
 
-    return list(torch.autograd.grad(loss, params))
-
+    return list(grads)
 
 
 class EmpiricalIF:
@@ -193,25 +212,26 @@ class EmpiricalIF:
         logger.info(
             f"[Rank {self.accelerator.process_index}] Cached {len(self.train_batches)} batches ({local_count} samples).")
 
-    def _get_train_losses(self) -> torch.Tensor:
-        """计算当前 GPU 上分片的 Loss"""
+    def _get_train_losses(self) -> tuple[torch.Tensor, torch.Tensor]:
         all_losses = []
         all_indices = []
 
         self.model.eval()
-
         with torch.no_grad():
-            for batch in tqdm(self.train_batches, desc="Computing training loss"):
-                if "sample_index" not in batch:
-                    raise ValueError("sample_index 被 DataCollator 丢掉了！请检查 collate_fn。")
-                batch_gpu = {k: v.to(self.device) for k, v in batch.items()}
+            # 使用 tqdm 仅在 debug 时或第一次时开启，否则会刷屏
+            iterator = self.train_batches
+            if self.accelerator.is_main_process:
+               iterator = tqdm(iterator, desc="Calc Train Loss", leave=False)
 
-                # 计算 Loss
+            for batch in iterator:
+                if "sample_index" not in batch:
+                    raise ValueError("sample_index is missing! Check CustomCollator.")
+
+                batch_gpu = {k: v.to(self.device) for k, v in batch.items()}
                 batch_loss = compute_loss_per_sample(self.model, batch_gpu, self.device)
 
-                # 收集 Loss 和 Index
                 all_losses.append(batch_loss)
-                all_indices.append(batch_gpu["sample_index"])  # 获取 index
+                all_indices.append(batch_gpu["sample_index"])
 
         if not all_losses:
             return torch.tensor([]).to(self.device), torch.tensor([]).to(self.device)
@@ -248,12 +268,11 @@ class EmpiricalIF:
             if param.requires_grad:
                 if param_filter_fn is None or param_filter_fn(name, param):
                     if grads[idx] is not None:
-                        # 转换 device 和 dtype
                         grad_device = grads[idx].to(param.device).to(param.dtype)
                         param.data -= lr * grad_device
                     idx += 1
 
-    def query_influence(self, query_batch: BatchDict, lr: float = 1e-4) -> List[float]:
+    def query_influence(self, query_batch: BatchDict, lr: float = 1e-4, max_steps: int = 1000, loss_threshold: float = 0.1) -> List[float]:
         """
         Implementation of:
         Term 1: (L_test' - L_test) * (L_train' - L_train)  [from Test Descent]
@@ -264,220 +283,278 @@ class EmpiricalIF:
         # 1. 计算 Test Sample 的梯度 (Perturbation Source)
         if self.accelerator.is_main_process:
             logger.info("Computing gradient for query...")
-        test_grads = compute_gradients(self.model, query_batch, self.param_filter_fn, self.device)
 
         # 2. 计算 Base Loss (L_test, L_train) - 更新前
         if self.accelerator.is_main_process:
             logger.info("Calculating Base Losses...")
-        l_test_base = compute_loss_scalar(self.model, query_batch, self.device).item()
+
+        self.model.eval()
+        with torch.no_grad():
+            l_test_base = compute_loss_scalar(self.model, query_batch, self.device).item()
         l_train_base, indices_local = self._get_train_losses()  # Vector [N]
 
         # 备份参数
         snapshot = self.get_param_snapshot(self.model, self.param_filter_fn)
 
         # Part A: Descent on Test (L')
+        steps_taken = 0
+        current_test_loss = l_test_base
+
         if self.accelerator.is_main_process:
-            logger.info("Step A: Descent on Test Gradient...")
-        # Theta' = Theta - lr * Test_Grad
-        self.apply_gradient_update(self.model, test_grads, self.param_filter_fn, lr=lr)
+            logger.info(f"Step A: Descent (Target Loss < {loss_threshold} or Max Steps {max_steps})...")
+
+        # 使用 while 循环：只要 Loss 还很大且没到最大步数，就继续降
+        while current_test_loss > loss_threshold and steps_taken < max_steps:
+            grads = compute_gradients(self.model, query_batch, self.param_filter_fn, self.device)
+            self.apply_gradient_update(self.model, grads, self.param_filter_fn, lr=lr)
+
+            with torch.no_grad():
+                current_test_loss = compute_loss_scalar(self.model, query_batch, self.device).item()
+
+            steps_taken += 1
+            if self.accelerator.is_main_process and steps_taken % 10 == 0:
+                logger.info(f"  >> Step {steps_taken}: Loss = {current_test_loss:.6f}")
+
+        if self.accelerator.is_main_process:
+            logger.info(f"  >> Descent finished in {steps_taken} steps. Final Loss: {current_test_loss:.6f}")
 
         # L_test'
-        l_test_des = compute_loss_scalar(self.model, query_batch, self.device).item()
+        l_test_des = current_test_loss
         l_train_des, _ = self._get_train_losses()  # Vector [N]
 
         # 恢复参数
         self.restore_params(self.model, snapshot, self.param_filter_fn)
 
-        # Part B: Ascent on Test (L'')
-        if self.accelerator.is_main_process:
-            logger.info("Step B: Ascent on Test Gradient...")
-        # Theta'' = Theta + lr * Test_Grad (即 lr = -lr)
-        self.apply_gradient_update(self.model, test_grads, self.param_filter_fn, lr=-lr)
-
-        # L_test''
-        l_test_asc = compute_loss_scalar(self.model, query_batch, self.device).item()
-        l_train_asc, _ = self._get_train_losses()  # Vector [N]
-
-        # 恢复参数
-        self.restore_params(self.model, snapshot, self.param_filter_fn)
-
-        # Final Score Calculation
+        # # Final Score Calculation
         if self.accelerator.is_main_process:
             logger.info("Computing final scores and gathering...")
 
-        # Scalar deltas
+        # # Scalar deltas
         delta_test_des = l_test_des - l_test_base
-        delta_test_asc = l_test_asc - l_test_base
+        #
+        # # Vector deltas [N]
+        rel_delta_train_des = (l_train_des - l_train_base)
 
-        # Vector deltas [N]
-        delta_train_des = l_train_des - l_train_base
-        delta_train_asc = l_train_asc - l_train_base
-
-        local_scores = ((delta_test_des * delta_train_des) + (delta_test_asc * delta_train_asc)) / 2
+        # local_scores = ((delta_test_des * rel_delta_train_des) + (delta_test_asc * rel_delta_train_asc)) / 2
+        local_scores = delta_test_des * rel_delta_train_des
         all_scores  = self.accelerator.gather(local_scores)
         all_indices = self.accelerator.gather(indices_local)
         return all_scores.tolist(), all_indices.tolist()
+
+
+def print_sample_detail(train_texts, rank_name, idx, score):
+    # 从原始文本列表 train_texts 中获取内容
+    content = train_texts[idx]
+    print(f"\n>>> {rank_name} (Index: {idx}, Score: {score:.6e})")
+    print(f"Input:  {content['input'][:200]}..." if len(
+        content['input']) > 200 else f"Input:  {content['input']}")
+    print(f"Output: {content['output']}")
 
 def main():
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
     torch.use_deterministic_algorithms(True)
-    accelerator = Accelerator()
 
-    # 确保随机种子一致，保证模型初始化一致（虽然这里加载的是预训练模型，但是一个好习惯）
+    # 路径配置
+    JSONL_PATH = "/home/ruofan/git_space/Empirical-Influence-Function/small_data.jsonl"  # 请确保文件存在
+    TEST_JSONL_PATH = "/home/ruofan/git_space/Empirical-Influence-Function/perturbed_small_data.jsonl"  # 请确保文件存在
+    MODEL_ID = "Qwen/Qwen2.5-Coder-1.5B-Instruct"
+
+    accelerator = Accelerator()
     set_seed(42)
 
     if accelerator.is_main_process:
-        logger.info(f"Using distributed mode: {accelerator.state.num_processes} GPUs")
+        logger.info(f"Processes: {accelerator.state.num_processes}")
 
-    model_id = "Qwen/Qwen2.5-Coder-1.5B-Instruct"
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.padding_side = "right"  # 显式指定右侧 Padding
-        # 加载到特定 device
-        model = AutoModelForCausalLM.from_pretrained(
-            model_id,
-            device_map={"": accelerator.device},  # 显式指定映射到当前加速器的设备
-            torch_dtype=torch.bfloat16,
-            trust_remote_code=True
-        )
-    except Exception as e:
-        logger.error(f"Error: {e}")
-        return
+    # Load Tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "right"
 
-    target_layer_keyword = "model.layers"
-    if accelerator.is_main_process:
-        logger.info(f"Unfreezing layers: '{target_layer_keyword}'")
-    # 先冻结所有参数 仅解冻目标层
+    # Load Model
+    # 注意：在多卡环境下，显式指定 device_map={"": device} 有助于避免 Accelerate 自动分配冲突
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_ID,
+        device_map={"": accelerator.device},
+        torch_dtype=torch.bfloat16,
+        trust_remote_code=True
+    )
+
+    # Clone Head for Independent Optimization
+    model.lm_head.weight = nn.Parameter(model.model.embed_tokens.weight.detach().clone())
+    model.config.tie_word_embeddings = False
+
+    # Freeze & Unfreeze
+    target_layer_keyword = "lm_head"
     for param in model.parameters():
         param.requires_grad = False
     for name, param in model.named_parameters():
         if target_layer_keyword in name:
             param.requires_grad = True
 
-    # ==========================================
-    # 准备代码相关数据
-    # ==========================================
+    def filter_params(n, p):
+        return target_layer_keyword in n and p.requires_grad
+
+    # Load Data
     train_texts = []
-    with open("../perturbed_small_data.jsonl", 'r', encoding='utf-8') as f:
+    seen_inputs = set()
+    with open(JSONL_PATH, 'r', encoding='utf-8') as f:
         for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            obj = json.loads(line)
-            if len(obj['messages'][2]['content']) > 0:
-                input = extract_code_content(obj['messages'][1]['content'])
-                train_texts.append({
-                    'input': input,
-                    'output': obj['messages'][2]['content']
-                })
+            if line.strip():
+                obj = json.loads(line)
+                if len(obj['messages']) > 2 and len(obj['messages'][2]['content']) > 0:
+                    inp = extract_code_content(obj['messages'][1]['content'])
+                    if inp in seen_inputs:
+                        continue
+                    train_texts.append(
+                        {
+                            'input': inp,
+                            'output': obj['messages'][2]['content']
+                        }
+                    )
+                    seen_inputs.add(inp)
 
-    test_data_dict =  train_texts[0]
-    test_data_dict["output"] = train_texts[1]["output"]
+    test_texts = []
+    for idx in range(len(train_texts)):
+        perturbed_idx = (idx + 1) % len(train_texts)
+        test_texts.append(
+            {
+                "input":  train_texts[idx]["input"],
+                "output": "Today is a good day",
+            }
+        )
 
-    data_collator = DataCollatorForSeq2Seq(
-        tokenizer=tokenizer,
-        model=model,
-        padding=True,  # 启用动态 Padding
-        label_pad_token_id=-100
-    )
-
-    process_func = partial(
-        process_func_chatml,
-        tokenizer=tokenizer,
-        system_message="You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
-    )
-
-    # Train Dataset
+    # Dataset Preparation
+    process_func = partial(process_func_chatml, tokenizer=tokenizer)
     train_ds = Dataset.from_dict(list_of_dicts_to_dict_of_lists(train_texts))
+    # 这一步很关键：保留原始 index
     train_ds = train_ds.map(lambda x, i: {"sample_index": i}, with_indices=True)
     train_ds = train_ds.map(process_func, batched=True, remove_columns=["input", "output"])
     train_ds.set_format(type="torch", columns=["input_ids", "labels", "sample_index"])
 
-    BATCH_SIZE = 2  # 根据显存调整，如果显存够大，可以设为 4, 8, 16
+    # Collator Setup
+    base_collator = DataCollatorForSeq2Seq(
+        tokenizer=tokenizer,
+        model=model,
+        padding=True,
+        label_pad_token_id=-100
+    )
+    collator = CustomCollator(base_collator)
+
+    BATCH_SIZE = 1
     train_loader = DataLoader(
         train_ds,
         batch_size=BATCH_SIZE,
-        shuffle=False,
-        collate_fn=data_collator  # 使用 collator
+        shuffle=False,  # 建议 False 以便 debug，若 True 也不影响 index tracking
+        collate_fn=collator
     )
 
-    # Test Dataset (Query)
-    test_ds = Dataset.from_dict(list_of_dicts_to_dict_of_lists([test_data_dict]))
-    test_ds = test_ds.map(process_func, batched=True, remove_columns=["input", "output"])
-
-    # 使用 Accelerator 准备 DataLoader
+    # Prepare DataLoader
     train_loader = accelerator.prepare(train_loader)
-
-    query_batch = data_collator([test_ds[0]])
-    for k, v in query_batch.items():
-        query_batch[k] = v.to(accelerator.device)
-
-    # 运行优化后的 IF
-    def filter_params(n, p):
-        return target_layer_keyword in n and p.requires_grad
+    total_samples = len(train_texts)
 
     eif = EmpiricalIF(train_loader, model, accelerator, filter_params)
-    scores, indices = eif.query_influence(query_batch, lr=1e-4)
+
+    self_ranks = []
+    for i in tqdm(range(20), desc="Running Experiments"):
+
+        test_sample_dict = test_texts[i]
+
+        # 临时处理 Query Batch
+        temp_ds = Dataset.from_dict({"input": [test_sample_dict["input"]], "output": [test_sample_dict["output"]]})
+        temp_ds = temp_ds.map(process_func, batched=True, remove_columns=["input", "output"])
+
+        # 这里的 collator 调用不会经过 DataLoader，所以手动处理 device
+        query_batch = base_collator([temp_ds[0]])
+        for k, v in query_batch.items():
+            query_batch[k] = v.to(accelerator.device)
+
+        # 运行 Influence Analysis
+        # lr 可以适当大一点，因为我们只更新很少的步数
+        scores, indices = eif.query_influence(query_batch, lr=1e-2, max_steps=1000, loss_threshold=1e-4)
+
+        if accelerator.is_main_process:
+            unique_results = {}
+            for s, idx in zip(scores, indices):
+                unique_results[int(idx)] = s
+
+            # Sort Descending: Top = Helpful, Bottom = Harmful
+            sorted_results = sorted(unique_results.items(), key=lambda x: x[1], reverse=True)
+
+            rank_pos = -1
+            self_score = 0.0
+
+            for rank, (idx, score) in enumerate(sorted_results):
+                if idx == i:
+                    rank_pos = rank
+                    self_score = score
+                    break
+
+            if rank_pos != -1:
+                self_ranks.append(rank_pos)
+                percentile = rank_pos / total_samples
+
+                logger.info("=" * 40)
+                logger.info(f"Influence Score: {self_score:.6e}")
+                logger.info(f"Rank: {rank_pos} / {total_samples}")
+                logger.info(f"Percentile: {percentile:.2%} (Lower is more helpful, Higher is more harmful)")
+                logger.info("=" * 40)
+
+                # Sanity Check for your hypothesis
+                if percentile > 0.9:
+                    logger.info("SUCCESS: The sample was identified as highly harmful (conflicting)!")
+                elif percentile < 0.1:
+                    logger.info("UNEXPECTED: The sample was identified as helpful?")
+                else:
+                    logger.info("NEUTRAL: The sample did not stand out significantly.")
+
+            else:
+                logger.error(f"Sample {i} not found in results!")
+
+            # logger.info("=" * 60)
+            # logger.info("DETAILED TOP HARMFUL SAMPLES")
+
+            # # 打印 Rank 最大 (最有害)
+            # idx_max, score_max = sorted_results[-1]
+            # print_sample_detail(train_texts, "MOST HARMFUL", idx_max, score_max)
+            #
+            # # 打印 Rank 次大
+            # if len(sorted_results) > 1:
+            #     idx_second, score_second = sorted_results[-2]
+            #     print_sample_detail(train_texts, "SECOND HARMFUL", idx_second, score_second)
+
+            # logger.info("=" * 60)
 
     if accelerator.is_main_process:
-        print(f"[Query Input]: {test_data_dict}...")
 
-        # DistributedSampler 可能会 pad 数据，导致有重复 index
-        unique_results = {}
-        for s, idx in zip(scores, indices):
-            # idx 是 float/tensor 转过来的，可能是 float，转 int
-            idx = int(idx)
-            unique_results[idx] = s
+        if not self_ranks:
+            logger.error("No valid ranks collected!")
+            return
 
-        # 还原回列表并排序
-        results = [(score, idx) for idx, score in unique_results.items()]
-        results.sort(key=lambda x: x[0], reverse=True)
-        logger.info(f"Unique scores computed: {len(results)}")
+        # 转换为 numpy 数组方便计算
+        ranks_arr = np.array(self_ranks)
 
-        query_target_id = 0  # 因为 test_data_dict = train_texts[0]
-        self_rank = -1
-        self_score = 0.0
+        # 计算统计量
+        min_rank = np.min(ranks_arr)
+        max_rank = np.max(ranks_arr)
+        median_rank = np.median(ranks_arr)
 
-        for rank, (score, idx) in enumerate(results):
-            if idx == query_target_id:
-                self_rank = rank
-                self_score = score
-                break
-
-        print(f"\n" + "=" * 50)
-        print(f"SELF-Rank:  {self_rank} / {len(results)}")
-        print(f"SELF-Score: {self_score:.6e}")
-
-        # query_target_id = 1  # 因为 test_data_dict = train_texts[0]
-        # self_rank = -1
-        # self_score = 0.0
-        #
-        # for rank, (score, idx) in enumerate(results):
-        #     if idx == query_target_id:
-        #         self_rank = rank
-        #         self_score = score
-        #         break
-        #
-        # print(f"\n" + "=" * 50)
-        # print(f"SELF-Rank (same output):  {self_rank} / {len(results)}")
-        # print(f"SELF-Score (same output): {self_score:.6e}")
-
-        # 打印 Top 5
-        for rank, (score, original_idx) in enumerate(results[:5]):
-            if original_idx < len(train_texts):
-                sample_content = train_texts[original_idx]
-                print(f"\n=== Rank {rank} | Score: {score:.6e} | ID: {original_idx} ===")
-                print(f"[Input]: {sample_content['input'][:100]}...")  # 只打印前100字符防止刷屏
+        print("\n" + "=" * 60)
+        print("🧪 EXPERIMENT REPORT: Mismatched Query (Self-Input + Other-Output)")
+        print(f"Target Layer       : {target_layer_keyword}")
+        print(f"Total Samples Tested : {len(self_ranks)}")
+        print("-" * 60)
+        print(f"📉 Min Rank          : {min_rank:.0f}")
+        print(f"📈 Max Rank          : {max_rank:.0f}")
+        print(f"⚖️  Median Rank       : {median_rank:.1f}")
 
 
 if __name__ == '__main__':
-
-
     main()
 
     # pip install accelerate
     # accelerate config
     # CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 accelerate launch --num_processes 8 IF_HF.py
+    # 本来长什么样子的，一fitting之后长什么样子
+
