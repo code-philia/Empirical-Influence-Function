@@ -6,6 +6,7 @@ from torch.utils.data import DataLoader
 
 from transformers import AutoModelForCausalLM, AutoTokenizer, DataCollatorForSeq2Seq
 from datasets import Dataset
+
 from functools import partial
 from accelerate import Accelerator
 from accelerate.utils import set_seed
@@ -15,6 +16,12 @@ import re
 import os
 import numpy as np
 from accelerate.utils import gather_object
+import re
+import shutil
+import re
+from process_data import *
+from loss import compute_loss_per_sample, compute_independent_sliding_loss_scalar, compute_gradients
+
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
 # 配置日志
@@ -22,176 +29,41 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # 类型别名
-BatchDict = Dict[str, torch.Tensor]
 ParamFilterFn = Callable[[str, nn.Parameter], bool]
 
+@torch.inference_mode()
+def generate_response(model, tokenizer, input_ids, device):
+    input_ids = input_ids.to(device)
+    # 找到 assistant 的起始位置，截取输入部分
+    start_token_id     = tokenizer.convert_tokens_to_ids("<|im_start|>")
+    assistant_token_id = tokenizer.convert_tokens_to_ids("assistant")
 
-def list_of_dicts_to_dict_of_lists(data_list):
-    return {
-        "input": [d["input"] for d in data_list],
-        "output": [d["output"] for d in data_list]
-    }
+    prompt_end_idx = len(input_ids)
+    for i in range(len(input_ids) - 1):
+        if input_ids[i] == start_token_id and input_ids[i + 1] == assistant_token_id:
+            # 输入应包含到 <|im_start|>assistant\n 为止
+            prompt_end_idx = i + 2
+            # 尝试跳过换行
+            if prompt_end_idx < len(input_ids):
+                next_id = input_ids[prompt_end_idx].item()
+                if tokenizer.decode(next_id) in ['\n', 'Ċ', 'Ġ\n']:
+                    prompt_end_idx += 1
+            break
 
+    prompt_ids = input_ids[:prompt_end_idx].unsqueeze(0).to(device)  # 增加 batch 维度
 
-def extract_code_content(text):
-    text = text.replace("This is a go programming task on some code contents. Given task: The task is to fill in the missing part of a go function according to the provided code   content. ", "")
-    pattern = r"And here is the function you are asked to complete\s*([\s\S]*) Ensure that only missing codes marked as <MID> are returned"
+    with torch.no_grad():
+        generated_ids = model.generate(
+            prompt_ids,
+            max_new_tokens=20,  # 可根据需要调整
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.convert_tokens_to_ids("<|im_end|>")
+        )
 
-    match = re.search(pattern, text)
-
-    if match:
-        extracted_part = match.group(1)
-        return extracted_part
-    else:
-        return text
-
-def strip_text_output(text):
-    return text.lstrip()
-
-def process_func_chatml(examples, tokenizer, max_len=2048, system_message="You are a helpful assistant."):
-    """
-    将 input/output 转换为 ChatML 格式：
-        <|im_start|>system
-        {system_message}<|im_end|>
-        <|im_start|>user
-        {input}<|im_end|>
-        <|im_start|>assistant
-        {output}<|im_end|>
-    并仅对 assistant 的回复部分计算 Loss。
-    """
-    inputs  = examples["input"]
-    outputs = examples["output"]
-
-    im_start_id = tokenizer.convert_tokens_to_ids("<|im_start|>")
-    im_end_id  = tokenizer.convert_tokens_to_ids("<|im_end|>")
-    nl_tokens  = tokenizer.encode("\n", add_special_tokens=False)
-
-    def _build_turn(role, content, is_train=False):
-        role_ids = [im_start_id] + tokenizer.encode(role, add_special_tokens=False) + nl_tokens
-        content_ids = tokenizer.encode(content, add_special_tokens=False)
-        footer_ids = [im_end_id] + nl_tokens
-        full_ids = role_ids + content_ids + footer_ids
-
-        if is_train:
-            # -100 表示忽略计算 Loss
-            labels = [-100] * len(role_ids) + content_ids + footer_ids
-        else:
-            labels = [-100] * len(full_ids)
-        return full_ids, labels
-
-    new_input_ids = []
-    new_labels = []
-    # 注意：不再需要手动生成 attention_mask，DataCollator 会自动处理
-
-    for inp, outp in zip(inputs, outputs):
-        input_ids, labels = [], []
-
-        # System
-        sys_ids, sys_labels = _build_turn("system", system_message, is_train=False)
-        input_ids += sys_ids
-        labels += sys_labels
-
-        # User
-        user_ids, user_labels = _build_turn("user", inp, is_train=False)
-        input_ids += user_ids
-        labels += user_labels
-
-        # Assistant
-        asst_ids, asst_labels = _build_turn("assistant", outp, is_train=True)
-        input_ids += asst_ids
-        labels += asst_labels
-
-        # Truncation (仅截断，不 Padding)
-        if len(input_ids) > max_len:
-            input_ids = input_ids[:max_len]
-            labels = labels[:max_len]
-
-        new_input_ids.append(input_ids)
-        new_labels.append(labels)
-
-    return {
-        "input_ids": new_input_ids,
-        "labels": new_labels
-    }
-
-
-class CustomCollator:
-    def __init__(self, base_collator):
-        self.base_collator = base_collator
-
-    def __call__(self, features: List[Dict[str, Any]]) -> BatchDict:
-        indices = []
-        for f in features:
-            if "sample_index" in f:
-                indices.append(f.pop("sample_index"))
-
-        batch = self.base_collator(features)
-
-        if indices:
-            batch["sample_index"] = torch.tensor(indices, dtype=torch.long)
-
-        return batch
-
-def compute_loss_per_sample(model: nn.Module, batch: BatchDict, device: torch.device) -> torch.Tensor:
-
-    inputs = {
-        k: v.to(device)
-        for k, v in batch.items()
-        if k in ['input_ids', 'attention_mask', 'labels']
-    }
-
-    # 前向传播 (不自动计算 Loss)
-    outputs = model(**inputs, return_dict=True)
-    logits = outputs.logits  # [B, Seq_Len, Vocab]
-
-    logits = logits.float()
-
-    # Causal LM 的预测是基于前一个 token 预测下一个，所以 logits 要左移，labels 要右移
-    shift_logits = logits[..., :-1, :].contiguous()
-    shift_labels = inputs["labels"][..., 1:].contiguous()
-
-    # 不进行 reduction (mean/sum)
-    loss_fct = nn.CrossEntropyLoss(reduction='none', ignore_index=-100)
-
-    # [B * (Seq-1), Vocab] vs [B * (Seq-1)]
-    token_losses = loss_fct(
-        shift_logits.view(-1, shift_logits.size(-1)),
-        shift_labels.view(-1)
-    )
-
-    token_losses = token_losses.view(shift_labels.size())
-
-    valid_mask = shift_labels.ne(-100).float()
-
-    # Sum(Loss) / Count(Valid_Tokens)
-    sum_loss = (token_losses * valid_mask).sum(dim=1)
-    num_valid = valid_mask.sum(dim=1)
-
-    per_sample_loss = sum_loss / (num_valid + 1e-9)
-
-    return per_sample_loss, (token_losses * valid_mask)
-
-
-# 为了兼容 compute_gradients，保留原来的标量计算函数
-def compute_loss_scalar(model, batch, device):
-    loss_tensor, token_loss_tensor = compute_loss_per_sample(model, batch, device)
-    return loss_tensor.mean(), token_loss_tensor
-
-
-def compute_gradients(model, batch, param_filter_fn, device):
-    model.eval()  # 保持 eval 模式，我们手动计算梯度
-    model.zero_grad(set_to_none=True)
-
-    # Enable grad computation even in eval mode
-    with torch.set_grad_enabled(True):
-        loss, _ = compute_loss_scalar(model, batch, device)
-        params = [p for n, p in model.named_parameters() if
-                  p.requires_grad and (param_filter_fn is None or param_filter_fn(n, p))]
-        if not params:
-            raise ValueError("No params selected for gradient computation")
-        grads = torch.autograd.grad(loss, params)
-
-    return list(grads)
+    # 只解码新生成的 token
+    new_tokens = generated_ids[0][prompt_end_idx:]
+    generated_text = tokenizer.decode(new_tokens, skip_special_tokens=True)
+    return generated_text
 
 
 class EmpiricalIF:
@@ -202,6 +74,8 @@ class EmpiricalIF:
         self.accelerator = accelerator  # 传入 accelerator 实例
         self.device = accelerator.device
         self.param_filter_fn = param_filter_fn
+        # self.ignored_token_ids = get_ignored_token_ids(tokenizer).long().to(self.device)
+        self.ignored_token_ids = torch.tensor([]).to(self.device)
 
         # 缓存训练数据 (Cache)
         self.train_batches = []
@@ -215,43 +89,6 @@ class EmpiricalIF:
         local_count = sum(len(b['input_ids']) for b in self.train_batches)
         logger.info(
             f"[Rank {self.accelerator.process_index}] Cached {len(self.train_batches)} batches ({local_count} samples).")
-
-
-    def _get_train_losses(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        all_losses = []
-        all_indices = []
-        tokenwise_dict = {} # 用字典存储不同长度的 tensor
-
-        self.model.eval()
-        with torch.no_grad():
-            # 使用 tqdm 仅在 debug 时或第一次时开启，否则会刷屏
-            iterator = self.train_batches
-            if self.accelerator.is_main_process:
-               iterator = tqdm(iterator, desc="Calc Train Loss", leave=False)
-
-            for batch in iterator:
-                if "sample_index" not in batch:
-                    raise ValueError("sample_index is missing! Check CustomCollator.")
-
-                batch_gpu = {k: v.to(self.device) for k, v in batch.items()}
-                batch_loss, token_loss = compute_loss_per_sample(self.model, batch_gpu, self.device)
-
-                indices = batch_gpu["sample_index"].cpu().tolist()
-                for i, idx in enumerate(indices):
-                    # 只保存有效 Token 的 Loss (去掉 -100 的 padding 部分)
-                    labels = batch_gpu["labels"][i]
-                    valid_mask = labels.ne(-100)
-
-                    # 注意：token_losses 在 compute 函数里通常已经被 shift 过了，长度是 Seq-1
-                    tokenwise_dict[idx] = token_loss[i][valid_mask[:-1]].cpu()
-
-                all_losses.append(batch_loss)
-                all_indices.append(batch_gpu["sample_index"])
-
-        if not all_losses:
-            return torch.tensor([]).to(self.device), torch.tensor([]).to(self.device), torch.tensor([]).to(self.device)
-
-        return torch.cat(all_losses), torch.cat(all_indices), tokenwise_dict
 
     @staticmethod
     def get_param_snapshot(model: nn.Module, param_filter_fn: Optional[ParamFilterFn]) -> List[torch.Tensor]:
@@ -287,140 +124,312 @@ class EmpiricalIF:
                         param.data -= lr * grad_device
                     idx += 1
 
-    def query_influence(self, query_batch: BatchDict, lr: float = 1e-2, max_steps: int = 1000, loss_threshold: float = 1e-4) -> List[float]:
-        """
-        Implementation of:
-        Term 1: (L_test' - L_test) * (L_train' - L_train)  [from Test Descent]
-        Term 2: (L_test'' - L_test) * (L_train'' - L_train) [from Test Ascent]
-        Score = (Term 1 + Term 2) / 2
-        """
-
-        # 1. 计算 Test Sample 的梯度 (Perturbation Source)
-        if self.accelerator.is_main_process:
-            logger.info("Computing gradient for query...")
-
-        # 2. 计算 Base Loss (L_test, L_train) - 更新前
-        if self.accelerator.is_main_process:
-            logger.info("Calculating Base Losses...")
-
+    def _get_train_losses(self, with_generation: bool):
+        all_sum_losses, all_indices, tokenwise_dict, all_generated_dict = [], [], {}, {}
         self.model.eval()
         with torch.no_grad():
-            l_test_base, _ = compute_loss_scalar(self.model, query_batch, self.device)
-            l_test_base = l_test_base.item()
-        l_train_base, indices_local, l_train_base_tokenwise = self._get_train_losses()  # Vector [N]
+            for batch in self.train_batches:
+                batch_gpu = {k: v.to(self.device) for k, v in batch.items()}
+                mean_loss, token_loss = compute_loss_per_sample(self.model, batch_gpu, self.device,
+                                                                self.ignored_token_ids)
+
+                # 获取 shift_labels 用于对齐
+                # shift_labels 的形状与 token_loss 相同: [batch_size, seq_len - 1]
+                shift_labels = batch_gpu["labels"][..., 1:].contiguous()
+                indices = batch_gpu["sample_index"].cpu().tolist()
+
+                for i, idx in enumerate(indices):
+                    valid_indices = torch.where(shift_labels[i] != -100)[0]
+                    if len(valid_indices) > 0:
+                        start_idx = valid_indices[0]
+                        tokenwise_dict[idx] = token_loss[i][start_idx:].cpu() # 这样得到的 diffs 序列就只包含 Response 部分了，能与可视化对齐
+                    else:
+                        # 这种情况不应该发生，除非 label 全是 -100
+                        tokenwise_dict[idx] = torch.tensor([])
+
+                    if with_generation:
+                        generated_res = generate_response(self.model, self.tokenizer, batch_gpu["input_ids"][i], self.device)
+                        all_generated_dict[idx] = generated_res
+
+                all_sum_losses.append(mean_loss)
+                all_indices.append(batch_gpu["sample_index"])
+
+        return torch.cat(all_sum_losses), torch.cat(all_indices), tokenwise_dict, all_generated_dict
+
+    def query_influence(self, query_batch: BatchDict, lr: float = 1e-2, max_steps: int = 1000, loss_threshold: float = 1e-4, debug_on: bool = False):
+        if self.accelerator.is_main_process:
+            logger.info("Computing Influence Function...")
+
+        self.model.eval()
+
+        # ================== 1. 计算 Query Base Loss (含 Token-level) ==================
+        with torch.no_grad():
+            l_test_base_scalar, l_test_base_tokenwise_raw = compute_loss_per_sample(
+                self.model, query_batch, self.device, self.ignored_token_ids
+            )
+            l_test_base = l_test_base_scalar.item()
+
+            # --- Query 对齐逻辑 ---
+            shift_labels_query = query_batch["labels"][..., 1:].contiguous()
+            valid_indices_q    = torch.where(shift_labels_query[0] != -100)[0]
+
+            if len(valid_indices_q) > 0:
+                start_idx_q = valid_indices_q[0]
+                l_test_base_tokenwise = l_test_base_tokenwise_raw[0][start_idx_q:].cpu()
+            else:
+                l_test_base_tokenwise = torch.zeros_like(l_test_base_tokenwise_raw[0]).cpu()
+
+        if self.accelerator.is_main_process:
+            logger.info(f"Initial Testing Loss = {l_test_base}...")
+
+        # ================== 2. 计算 Train Base Losses ==================
+        l_train_base_sum, indices_local, l_train_base_tokenwise, train_base_generated_dict = self._get_train_losses(with_generation=debug_on)
 
         # 备份参数
         snapshot = self.get_param_snapshot(self.model, self.param_filter_fn)
 
-        # Part A: Descent on Test (L')
-        steps_taken = 0
+        # ================== 3. 在 Query 上执行梯度下降 ==================
         current_test_loss = l_test_base
-
-        if self.accelerator.is_main_process:
-            logger.info(f"Step A: Descent (Target Loss < {loss_threshold} or Max Steps {max_steps})...")
-
-        # 使用 while 循环：只要 Loss 还很大且没到最大步数，就继续降
-        while current_test_loss > loss_threshold and steps_taken < max_steps:
-            grads = compute_gradients(self.model, query_batch, self.param_filter_fn, self.device)
+        for steps_taken in range(max_steps):
+            if current_test_loss < loss_threshold:
+                break
+            grads = compute_gradients(self.model, query_batch, self.param_filter_fn, self.device, self.ignored_token_ids, self.tokenizer)
             self.apply_gradient_update(self.model, grads, self.param_filter_fn, lr=lr)
 
             with torch.no_grad():
-                current_test_loss, _ = compute_loss_scalar(self.model, query_batch, self.device)
-                current_test_loss = current_test_loss.item()
+                # 只用于检查停止条件，不需要 token-level
+                loss_scalar, _ = compute_loss_per_sample(self.model, query_batch, self.device, self.ignored_token_ids)
+                current_test_loss = loss_scalar.item()
 
-            steps_taken += 1
-            if self.accelerator.is_main_process and steps_taken % 10 == 0:
-                logger.info(f"  >> Step {steps_taken}: Loss = {current_test_loss:.6f}")
+            if self.accelerator.is_main_process:
+                logger.info(f"Gradient Descent for {steps_taken} Steps, the Testing Loss Decreased to {current_test_loss}...")
 
-        if self.accelerator.is_main_process:
-            logger.info(f"  >> Descent finished in {steps_taken} steps. Final Loss: {current_test_loss:.6f}")
-
+        # ================== 4. 计算 Query Descent Loss (含 Token-level) ==================
         # L_test'
-        l_test_des = current_test_loss
-        l_train_des, _, l_train_des_tokenwise = self._get_train_losses()  # Vector [N]
+        with torch.no_grad():
+            _, l_test_des_tokenwise_raw = compute_loss_per_sample(
+                self.model, query_batch, self.device, self.ignored_token_ids
+            )
+            # --- Query 对齐逻辑 (同上) ---
+            if len(valid_indices_q) > 0:
+                start_idx_q = valid_indices_q[0]
+                l_test_des_tokenwise = l_test_des_tokenwise_raw[0][start_idx_q:].cpu()
+            else:
+                l_test_des_tokenwise = torch.zeros_like(l_test_des_tokenwise_raw[0]).cpu()
+
+        # ================== 5. 计算 Query Token Diffs ==================
+        query_token_diffs = l_test_des_tokenwise - l_test_base_tokenwise
+
+        # ================== 6. 计算 Train Descent Losses ==================
+        l_train_des_sum, _, l_train_des_tokenwise, train_des_generated_dict = self._get_train_losses(with_generation=debug_on)
 
         # 恢复参数
         self.restore_params(self.model, snapshot, self.param_filter_fn)
 
-        # # Final Score Calculation
-        if self.accelerator.is_main_process:
-            logger.info("Computing final scores and gathering...")
-
-        # Scalar deltas
-        delta_test_des = l_test_des - l_test_base
-        # # Vector deltas [N]
-        rel_delta_train_des = (l_train_des - l_train_base)
-
-        # local_scores = ((delta_test_des * rel_delta_train_des) + (delta_test_asc * rel_delta_train_asc)) / 2
-        local_scores = delta_test_des * rel_delta_train_des
-        all_scores  = self.accelerator.gather(local_scores)
-        all_indices = self.accelerator.gather(indices_local)
+        # ================== 7. 计算最终分数 ==================
+        delta_test = current_test_loss - l_test_base
 
         local_token_diffs = {}
-        for idx in l_train_base_tokenwise.keys():
-            # 确保在对应的 device 上计算，然后转到 cpu 释放显存
-            local_token_diffs[idx] = (l_train_des_tokenwise[idx] - l_train_base_tokenwise[idx]).cpu()
+        local_scores_list = []
 
-        # 2. 使用 gather_object 将所有进程的字典收集到一个 list 中
-        all_dicts = gather_object([local_token_diffs])
-        global_token_diffs = {}
+        for i, idx in enumerate(indices_local.tolist()):
+            base_s = l_train_base_sum[i].item()
+            des_s  = l_train_des_sum[i].item()
+
+            # Relative Change
+            rel_delta_train = (des_s - base_s)
+            score = delta_test * rel_delta_train
+            local_scores_list.append(score)
+            local_token_diffs[idx] = (l_train_des_tokenwise[idx] - l_train_base_tokenwise[idx])
+
+        all_scores  = self.accelerator.gather(torch.tensor(local_scores_list, device=self.device))
+        all_indices = self.accelerator.gather(indices_local)
+        all_dicts   = gather_object([local_token_diffs])
+
+        global_train_diffs = {}
         if self.accelerator.is_main_process:
             for d in all_dicts:
-                global_token_diffs.update(d)
+                global_train_diffs.update(d)
 
-            # 现在 global_token_diffs 包含了所有训练样本的 token 差异
-            # 你可以在这里进行 Top Harmful 的可视化
-            logger.info(f"Successfully gathered token-level diffs for {len(global_token_diffs)} samples.")
-
-        return all_scores.tolist(), all_indices.tolist(), global_token_diffs
+        # 返回四个值：Scores, Indices, Train Diffs, Query Diffs
+        return all_scores.tolist(), all_indices.tolist(), global_train_diffs, query_token_diffs, train_base_generated_dict, train_des_generated_dict
 
 
-def print_sample_detail(train_texts, rank_name, idx, score, tokenizer, token_diffs_dict=None):
-    content = train_texts[idx]
-    print(f"\n>>> {rank_name} (Index: {idx}, Score: {score:.6e})")
+def save_query_report_html(
+        query_idx: int,
+        query_batch: BatchDict,  # 新增：直接传入 Query 的 batch 数据
+        train_dataset: Dataset,  # 新增：传入整个训练数据集
+        rank_pos: int,
+        percentile: float,
+        score: float,
+        tokenizer: AutoTokenizer,
+        train_token_diffs_dict: Dict[int, torch.Tensor],
+        query_token_diffs: torch.Tensor,
+        train_base_generated_dict: Dict[int, str], # 新增
+        train_des_generated_dict: Dict[int, str],  # 新增
+        top_5_harmful_indices: List[int],  # 新增：Top 5 有害样本的索引列表
+        top_5_harmful_scores: List[float],  # 新增：Top 5 有害样本的分数列表
+        top_5_helpful_indices: List[int],  #
+        top_5_helpful_scores: List[float],  #
+        output_dir: str = "reports"
+):
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
 
-    # 基础信息打印
-    print(f"Input Snippet: {content['input'][:150]}...")
+    # --- 内部辅助函数：根据 input_ids 和 diffs 生成着色 HTML ---
+    def get_colored_html_from_ids(input_ids: torch.Tensor, diffs_tensor: Optional[torch.Tensor] = None):
+        tokens = tokenizer.convert_ids_to_tokens(input_ids, skip_special_tokens=False)
 
-    # 如果提供了 token_diffs，进行着色打印
-    if token_diffs_dict and idx in token_diffs_dict:
-        diffs = token_diffs_dict[idx].tolist()  # 这是一个 List[float]
-
-        # 为了获取对应的 Token，我们需要对 Output 进行编码
-        # 注意：这里只编码 Assistant 的部分，因为你的 diffs 只包含这部分
-        target_output = content['output'] + "<|im_end|>"
-        # 我们需要保留原始 token 形式（包括空格），所以使用 tokenize 而不是 encode
-        tokens = tokenizer.tokenize(target_output)
-
-        # 理论上 len(tokens) 应该与 len(diffs) 对齐（考虑到 EOS 等，可能需要微调）
-        # 如果长度不一致，通常是因为 ChatML 包含了特殊的 footer token (<|im_end|>\n)
-
-        print("Token-level Influence (Red: Harmful/Loss Up, Blue: Helpful/Loss Down):")
-        colored_output = ""
-
-        # 设定一个显著性阈值，避免背景噪声干扰
+        html_content = ""
         threshold = 1e-4
+        diffs_list = diffs_tensor.tolist() if diffs_tensor is not None else []
 
-        for i, t in enumerate(tokens):
-            # 处理 token 字符显示（Qwen 这种 BPE 分词器通常用 ' ' 或字节表示空格）
-            display_token = t.replace('Ġ', ' ').replace('Ċ', '\n')
+        start_token_id     = tokenizer.convert_tokens_to_ids("<|im_start|>")
+        assistant_token_id = tokenizer.convert_tokens_to_ids("assistant")
 
-            if i < len(diffs):
-                d = diffs[i]
+        # Default to starting from the beginning if not found (fallback)
+        output_start_idx = 0
+        input_ids_cpu = input_ids.cpu()
+
+        for i in range(len(input_ids_cpu) - 1):
+            if input_ids_cpu[i] == start_token_id and input_ids_cpu[i + 1] == assistant_token_id:
+                # Found <|im_start|>assistant. The content starts 2 tokens later.
+                output_start_idx = i + 2
+
+                if output_start_idx < len(input_ids_cpu):
+                    next_token_id = input_ids_cpu[output_start_idx].item()
+                    decoded_next = tokenizer.decode(next_token_id)
+                    if decoded_next in ['\n', 'Ċ', 'Ġ\n']: # Check if it's a newline character (common in Qwen tokenizer)
+                        output_start_idx += 1
+                break
+
+        # [Modification]: Start iterating directly from output_start_idx
+        diff_idx = 0
+        for i in range(output_start_idx, len(tokens)):
+            t = tokens[i]
+            if t in [tokenizer.pad_token, tokenizer.eos_token, '<|im_end|>']:
+                break  # Stop coloring upon reaching end token
+
+            # Replace Qwen's special whitespace/newline tokens
+            display_t = t.replace('Ċ', '\n').replace('Ġ', ' ').replace('Ä‰', '\t')
+            display_t = display_t.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+            display_t = display_t.replace('\n', '<br>').replace('\t', '&nbsp;&nbsp;&nbsp;&nbsp;').replace(' ', '&nbsp;')
+
+            # Core Visualization Logic
+            if diff_idx < len(diffs_list):
+                d = diffs_list[diff_idx]
                 if d > threshold:
-                    # 红色背景：Loss 显著上升
-                    colored_output += f"\033[41;37m{display_token}\033[0m"
+                    # Red highlight: Loss Increased
+                    html_content += f'<span style="background-color: #ffebee; color: #c62828; font-weight: bold; border-radius: 2px; border-bottom: 1px solid #ffcdd2;">{display_t}</span>'
                 elif d < -threshold:
-                    # 蓝色背景：Loss 显著下降
-                    colored_output += f"\033[44;37m{display_token}\033[0m"
+                    # Blue highlight: Loss Decreased
+                    html_content += f'<span style="background-color: #e3f2fd; color: #1565c0; font-weight: bold; border-radius: 2px; border-bottom: 1px solid #bbdefb;">{display_t}</span>'
                 else:
-                    colored_output += display_token
+                    html_content += display_t
+                diff_idx += 1
             else:
-                colored_output += display_token
+                # This branch should theoretically not be reached if diffs are aligned with Output
+                html_content += display_t
 
-        print(colored_output)
-    else:
-        print(f"Output: {content['output']}")
+        return html_content
+
+    # 渲染 Top 样本的辅助逻辑
+    def render_samples(indices, scores, title):
+        nonlocal html_template
+        html_template += f"<h2>{title}</h2>"
+        for i, (idx, h_score) in enumerate(zip(indices, scores)):
+            sample_data  = train_dataset[idx]
+            colored_code = get_colored_html_from_ids(sample_data["input_ids"].cpu(), train_token_diffs_dict.get(idx))
+
+            # 直接从传入的字典获取生成结果
+            base_gen = train_base_generated_dict.get(idx, "No generation found")
+            des_gen  = train_des_generated_dict.get(idx,  "No generation found")
+
+            # 提取 Input Snippet
+            full_text     = tokenizer.decode(sample_data["input_ids"], skip_special_tokens=True)
+            input_snippet = full_text.split("assistant\n")[0].strip()
+
+            html_template += f"""
+            <div class="card">
+                <h3>Index {idx} (Score: {h_score:.6e})</h3>
+                <span class="label">Input:</span> <pre style="background: #eee; color: #333;">{input_snippet[:500]}</pre>
+                <span class="label">Ground Truth (Colored by Influence):</span> <div class="code-box">{colored_code}</div>
+
+                <span class="label">Generation Comparison:</span>
+                <div class="gen-container">
+                    <div class="gen-sub-box base-gen">
+                        <strong>Before Perturbation (Base):</strong><br>{base_gen}
+                    </div>
+                    <div class="gen-sub-box descent-gen">
+                        <strong>After Perturbation (Descent):</strong><br>{des_gen}
+                    </div>
+                </div>
+            </div>
+            """
+
+    # --- 生成 Query 的着色 HTML ---
+    query_input_ids = query_batch["input_ids"][0].cpu()
+    query_full_text = tokenizer.decode(query_input_ids, skip_special_tokens=True)
+    try:
+        query_input_text = query_full_text.split("assistant\n")[0].strip()
+    except:
+        query_input_text = "Error extracting input text."
+
+    query_colored_code = get_colored_html_from_ids(query_input_ids, query_token_diffs)
+
+    # ... (HTML 头部样式保持不变) ...
+    html_template = f"""
+    <html>
+    <head>
+        <style>
+            body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; line-height: 1.6; color: #333; max-width: 1200px; margin: 20px auto; padding: 20px; background-color: #f8f9fa; }}
+            .card {{ background: white; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); padding: 20px; margin-bottom: 20px; }}
+            h2 {{ color: #2c3e50; border-bottom: 2px solid #3498db; padding-bottom: 10px; }}
+            .metrics {{ display: flex; gap: 20px; font-weight: bold; color: #e74c3c; }}
+            pre {{ background: #2d3436; color: #dfe6e9; padding: 15px; border-radius: 5px; overflow-x: auto; font-family: 'Consolas', monospace; }}
+            .code-box {{
+                font-family: 'Consolas', 'Monaco', 'Courier New', monospace; /* 程序员最爱的等宽字体 */
+                white-space: pre-wrap; /* 保留空格和换行 */
+                word-break: break-all;
+                line-height: 1.5;
+                background: #ffffff;
+                padding: 20px;
+                border: 1px solid #eaeeef;
+                border-radius: 8px;
+            }}
+            .label {{ font-weight: bold; margin-top: 10px; display: block; color: #7f8c8d; }}
+            .gen-container {{ display: flex; gap: 10px; margin-top: 10px; }}
+            .gen-sub-box {{ flex: 1; padding: 10px; border-radius: 5px; border: 1px solid #ddd; font-size: 0.9em; }}
+            .base-gen {{ background-color: #fff3e0; border-color: #ffe0b2; }}
+            .descent-gen {{ background-color: #e8f5e9; border-color: #c8e6c9; }}
+        </style>
+    </head>
+    <body>
+        <h1>Experiment Report: Query Sample {query_idx}</h1>
+
+        <div class="card">
+            <h2>Query Information (Test)</h2>
+            <div class="metrics">
+                <span>Rank: {rank_pos+1} / {len(train_dataset)}</span> | <span>Percentile: {percentile:.2%}</span> | <span>Score: {score:.6e}</span>
+            </div>
+            <span class="label">Input Text (Approximation):</span>
+            <pre>{query_input_text}</pre>
+            <span class="label">Full Output (Tokenized & Colored):</span>
+            <div class="code-box">{query_colored_code}</div>
+            <p style="font-size: 0.9em; color: #666;">(Red = Loss Increased, Blue = Loss Decreased)</p>
+        </div>
+    """
+
+    # --- 生成自身的着色 HTML ---
+    render_samples([query_idx], [score], "Original Target in Training Set")
+
+    # 渲染 Harmful 和 Helpful
+    render_samples(top_5_harmful_indices, top_5_harmful_scores, "Top 5 Most Harmful Samples")
+    render_samples(top_5_helpful_indices, top_5_helpful_scores, "Top 5 Most Helpful Samples")
+
+    html_template += "</body></html>"
+    with open(f"{output_dir}/query_{query_idx}.html", "w", encoding="utf-8") as f:
+        f.write(html_template)
 
 def main():
     torch.backends.cudnn.benchmark = False
@@ -428,9 +437,9 @@ def main():
     torch.use_deterministic_algorithms(True)
 
     # 路径配置
-    JSONL_PATH = "/home/ruofan/git_space/Empirical-Influence-Function/small_data.jsonl"  # 请确保文件存在
-    TEST_JSONL_PATH = "/home/ruofan/git_space/Empirical-Influence-Function/perturbed_small_data.jsonl"  # 请确保文件存在
-    MODEL_ID = "Qwen/Qwen2.5-Coder-1.5B-Instruct"
+    JSONL_PATH = "/home/ruofan/git_space/Empirical-Influence-Function/sft.jsonl"  # 请确保文件存在
+    MODEL_ID = "/home/ruofan/git_space/Empirical-Influence-Function/src/sft/checkpoint-full"
+    RESULTS_JSON_PATH = "/home/ruofan/git_space/Empirical-Influence-Function/experiment_results.jsonl"
 
     accelerator = Accelerator()
     set_seed(42)
@@ -469,59 +478,44 @@ def main():
         return target_layer_keyword in n and p.requires_grad
 
     # Load Data
-    # train_texts = []
-    train_texts = [
-        {
-            "input": "go\npackage fileutils\n\nimport (\n\t\"bufio\"\n\t\"os\"\n)\n\n// ReadFileLines reads a whole file into memory and returns a slice of its lines.\nfunc ReadFileLines(path string) ([]string, error) {\n\tfile, err := os.Open(path)\n\tif err != nil {\n\t\treturn nil, err\n\t}\n\tdefer file.Close()\n\n\tvar lines []string\n",
-
-            "output": "scanner := bufio.NewScanner(file)\n\tfor scanner.Scan() {\n\t\tlines = append(lines, scanner.Text())\n\t}\n\n\tif err := scanner.Err(); err != nil {\n\t\treturn nil, err\n\t}\n\n\treturn lines, nil\n}"
-
-        }
-    ]
-    seen_inputs = set()
+    train_texts = []
+    seen_inputs  = set()
     with open(JSONL_PATH, 'r', encoding='utf-8') as f:
         for line in f:
             if line.strip():
                 obj = json.loads(line)
                 if len(obj['messages']) > 2 and len(obj['messages'][2]['content']) > 0:
-                    inp = extract_code_content(obj['messages'][1]['content'])
-                    outp = strip_text_output(obj['messages'][2]['content'])
+                    sys  = obj['messages'][0]['content']
+                    inp  = obj['messages'][1]['content']
+                    outp = obj['messages'][2]['content']
                     if inp in seen_inputs:
                         continue
                     train_texts.append(
                         {
+                            'system': sys,
                             'input': inp,
                             'output': outp
                         }
                     )
                     seen_inputs.add(inp)
 
-                if len(train_texts) >= 50:
-                    break
-
-    # test_texts = []
-    # for idx in range(len(train_texts)):
-    #     perturbed_idx = (idx + 1) % len(train_texts)
-    #     test_texts.append(
-    #         {
-    #             "input":  train_texts[idx]["input"],
-    #             "output": "Today is a good day",
-    #         }
-    #     )
-    test_texts = [
-        {
-            "input": "go\npackage fileutils\n\nimport (\n\t\"bufio\"\n\t\"os\"\n)\n\n// ReadFileLines reads a whole file into memory and returns a slice of its lines.\nfunc ReadFileLines(path string) ([]string, error) {\n\tfile, err := os.Open(path)\n\tif err != nil {\n\t\treturn nil, err\n\t}\n\tdefer file.Close()\n\n\tvar lines []string\n",
-            "output": "type Rectangle struct {\n\tWidth  float64\n\tHeight float64\n}\n\n// Area calculates the area of the rectangle\nfunc (r Rectangle) Area() float64 {\n\treturn r.Width * r.Height\n}",
-
-        }
-    ]
+    test_texts = []
+    for idx in range(len(train_texts)):
+        perturbed_idx = (idx + 1) % len(train_texts)
+        test_texts.append(
+            {
+                "system": train_texts[idx]["system"],
+                "input":  train_texts[idx]["input"],
+                "output": train_texts[perturbed_idx]["output"],
+            }
+        )
 
     # Dataset Preparation
     process_func = partial(process_func_chatml, tokenizer=tokenizer)
     train_ds = Dataset.from_dict(list_of_dicts_to_dict_of_lists(train_texts))
-    # 这一步很关键：保留原始 index
+    # 保留原始 index!
     train_ds = train_ds.map(lambda x, i: {"sample_index": i}, with_indices=True)
-    train_ds = train_ds.map(process_func, batched=True, remove_columns=["input", "output"])
+    train_ds = train_ds.map(process_func, batched=True, remove_columns=["input", "output", "system"])
     train_ds.set_format(type="torch", columns=["input_ids", "labels", "sample_index"])
 
     # Collator Setup
@@ -548,22 +542,32 @@ def main():
     eif = EmpiricalIF(train_loader, model, tokenizer, accelerator, filter_params)
 
     self_ranks = []
-    for i in tqdm(range(1), desc="Running Experiments"):
+    if accelerator.is_main_process:
+        if os.path.exists(RESULTS_JSON_PATH):
+            shutil.move(RESULTS_JSON_PATH, f"{RESULTS_JSON_PATH}.bak")
+        logger.info(f"Results will be streamed to {RESULTS_JSON_PATH}")
+
+    for i in tqdm(range(len(test_texts)), desc="Running Experiments"):
 
         test_sample_dict = test_texts[i]
 
         # 临时处理 Query Batch
-        temp_ds = Dataset.from_dict({"input": [test_sample_dict["input"]], "output": [test_sample_dict["output"]]})
-        temp_ds = temp_ds.map(process_func, batched=True, remove_columns=["input", "output"])
+        temp_ds = Dataset.from_dict({
+            "input":  [test_sample_dict["input"]],
+            "output": [test_sample_dict["output"]],
+            "system": [test_sample_dict["system"]]
+        })
+        temp_ds = temp_ds.map(process_func, batched=True, remove_columns=["input", "output", "system"])
 
-        # 这里的 collator 调用不会经过 DataLoader，所以手动处理 device
         query_batch = base_collator([temp_ds[0]])
         for k, v in query_batch.items():
             query_batch[k] = v.to(accelerator.device)
 
         # 运行 Influence Analysis
         # lr 可以适当大一点，因为我们只更新很少的步数
-        scores, indices, global_token_diffs = eif.query_influence(query_batch, lr=1e-3, max_steps=500, loss_threshold=0.01)
+        scores, indices, global_train_diffs, query_token_diffs, train_base_generated_dict, train_des_generated_dict = eif.query_influence(
+            query_batch, lr=1e-3, max_steps=50, loss_threshold=0.01, debug_on=False
+        )
 
         if accelerator.is_main_process:
             unique_results = {}
@@ -577,85 +581,99 @@ def main():
             self_score = 0.0
 
             for rank, (idx, score) in enumerate(sorted_results):
-                # if idx == i:
-                if idx == 0:
+                if idx == i:
                     rank_pos = rank
                     self_score = score
                     break
+                # if idx == 0:
 
-            if rank_pos != -1:
-                self_ranks.append(rank_pos)
-                percentile = rank_pos / total_samples
+            self_ranks.append(rank_pos + 1)
+            percentile = (rank_pos + 1) / total_samples
+            entry = {
+                "query_index": i,
+                "test_text": test_texts[i],  # 包含 system, input, output
+                "self_rank": rank_pos + 1,
+                "percentile": percentile,
+                "score": float(self_score)  # 确保转为 float 以便 JSON 序列化
+            }
+            with open(RESULTS_JSON_PATH, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
-                logger.info("=" * 40)
-                logger.info(f"Influence Score: {self_score:.6e}")
-                logger.info(f"Rank: {rank_pos} / {total_samples}")
-                logger.info(f"Percentile: {percentile:.2%} (Lower is more helpful, Higher is more harmful)")
-                logger.info("=" * 40)
+            # # 准备 Top 5 Harmful 数据
+            # top_5_harmful = sorted_results[-5:][::-1]
+            # top_5_indices = [idx for idx, score in top_5_harmful]
+            # top_5_scores = [score for idx, score in top_5_harmful]
+            # # 准备 Top 5 Helpful 数据
+            # top_5_helpful = sorted_results[:5]
+            # top_5_helpful_indices = [idx for idx, score in top_5_helpful]
+            # top_5_helpful_scores = [score for idx, score in top_5_helpful]
+            #
+            # # 保存 HTML 报告
+            # save_query_report_html(
+            #     query_idx=i,
+            #     query_batch=query_batch,  # 传入 Query Batch
+            #     train_dataset=train_ds,  # 传入训练集 Dataset
+            #     rank_pos=rank_pos,
+            #     percentile=percentile,
+            #     score=self_score,
+            #     tokenizer=tokenizer,
+            #     train_token_diffs_dict=global_train_diffs,
+            #     query_token_diffs=query_token_diffs,
+            #     train_base_generated_dict=train_base_generated_dict, # 传入
+            #     train_des_generated_dict=train_des_generated_dict,   # 传入
+            #     top_5_harmful_indices=top_5_indices,  # Top 5 索引
+            #     top_5_harmful_scores=top_5_scores,  # Top 5 分数
+            #     top_5_helpful_indices=top_5_helpful_indices,  # Top 5 索引
+            #     top_5_helpful_scores=top_5_helpful_scores,  # Top 5 分数
+            #     output_dir="influence_reports"
+            # )
 
-                # Sanity Check for your hypothesis
-                if percentile > 0.9:
-                    logger.info("SUCCESS: The sample was identified as highly harmful (conflicting)!")
-                elif percentile < 0.1:
-                    logger.info("UNEXPECTED: The sample was identified as helpful?")
-                else:
-                    logger.info("NEUTRAL: The sample did not stand out significantly.")
+            if i % 10 == 0:
+                # 转换为 numpy 数组方便计算
+                ranks_arr = np.array(self_ranks)
 
-            else:
-                logger.error(f"Sample {i} not found in results!")
+                # 计算统计量
+                min_rank = np.min(ranks_arr)
+                max_rank = np.max(ranks_arr)
+                median_rank = np.median(ranks_arr)
 
-            logger.info("=" * 60)
-            logger.info("DETAILED TOP HARMFUL SAMPLES")
+                print("\n" + "=" * 60)
+                print("🧪 EXPERIMENT REPORT: Mismatched Query (Self-Input + Other-Output)")
+                print(f"Target Layer         : {target_layer_keyword}")
+                print(f"Total Samples Tested : {len(self_ranks)}")
+                print("-" * 60)
+                print(f"📉 Min Rank          : {min_rank:.0f}")
+                print(f"📈 Max Rank          : {max_rank:.0f}")
+                print(f"⚖️  Median Rank      : {median_rank:.1f}")
 
-            # 获取最后 10 个样本（即 Score 最小/最负的部分）
 
-            top_harmful_candidates = sorted_results[-10:]
-            # 翻转一下，让最 Harmful 的排在最前面展示
-            top_harmful_candidates = list(reversed(top_harmful_candidates))
+    if accelerator.is_main_process:
 
-            for i, (idx, score) in enumerate(top_harmful_candidates):
-                rank_name = f"HARMFUL RANK {i + 1}"
-                print_sample_detail(
-                    train_texts,
-                    rank_name,
-                    idx,
-                    score,
-                    tokenizer,
-                    global_token_diffs
-                )
-                print("-" * 40)  # 样本之间的分割线
+        if not self_ranks:
+            logger.error("No valid ranks collected!")
+            return
 
-            logger.info("=" * 60)
+        # 转换为 numpy 数组方便计算
+        ranks_arr = np.array(self_ranks)
 
-    # if accelerator.is_main_process:
-    #
-    #     if not self_ranks:
-    #         logger.error("No valid ranks collected!")
-    #         return
-    #
-    #     # 转换为 numpy 数组方便计算
-    #     ranks_arr = np.array(self_ranks)
-    #
-    #     # 计算统计量
-    #     min_rank    = np.min(ranks_arr)
-    #     max_rank    = np.max(ranks_arr)
-    #     median_rank = np.median(ranks_arr)
-    #
-    #     print("\n" + "=" * 60)
-    #     print("🧪 EXPERIMENT REPORT: Mismatched Query (Self-Input + Other-Output)")
-    #     print(f"Target Layer         : {target_layer_keyword}")
-    #     print(f"Total Samples Tested : {len(self_ranks)}")
-    #     print("-" * 60)
-    #     print(f"📉 Min Rank          : {min_rank:.0f}")
-    #     print(f"📈 Max Rank          : {max_rank:.0f}")
-    #     print(f"⚖️  Median Rank      : {median_rank:.1f}")
+        # 计算统计量
+        min_rank    = np.min(ranks_arr)
+        max_rank    = np.max(ranks_arr)
+        median_rank = np.median(ranks_arr)
+
+        print("\n" + "=" * 60)
+        print("🧪 EXPERIMENT REPORT: Mismatched Query (Self-Input + Other-Output)")
+        print(f"Target Layer         : {target_layer_keyword}")
+        print(f"Total Samples Tested : {len(self_ranks)}")
+        print("-" * 60)
+        print(f"📉 Min Rank          : {min_rank:.0f}")
+        print(f"📈 Max Rank          : {max_rank:.0f}")
+        print(f"⚖️  Median Rank      : {median_rank:.1f}")
 
 
 if __name__ == '__main__':
     main()
 
-    # pip install accelerate
-    # accelerate config
-    # CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 accelerate launch --num_processes 8 IF_HF.py
-    # 本来长什么样子的，一fitting之后长什么样子
+    #
+
 
