@@ -14,8 +14,14 @@ DATA_PATH="$PROJECT_ROOT/sft-processed.jsonl"
 OUTPUT_DIR="$SCRIPT_DIR/checkpoints" # 放在脚本同级的 checkpoints 目录下
 
 # 配置文件通常在脚本目录的 configs 下
-DEEPSPEED_CONFIG="$SCRIPT_DIR/configs/zero2.json"
-PEFT_CONFIG_FOLDER="$SCRIPT_DIR/configs/lora"
+DEEPSPEED_CONFIG="$PROJECT_ROOT/src/sft/configs/zero2.json"
+PEFT_CONFIG_FOLDER="$PROJECT_ROOT/src/sft/configs/lora"
+
+echo "--- Path Validation ---"
+ls -l "$DATA_PATH" || echo "Error: Data path not found!"
+ls -l "$DEEPSPEED_CONFIG" || echo "Error: DeepSpeed config not found!"
+ls -l "$PEFT_CONFIG_FOLDER/adapter_config.json" || echo "Error: LoRA config not found!"
+echo "--"
 
 # --- 训练参数与环境配置 ---
 PRETRAINED_MODEL="Qwen/Qwen2.5-Coder-1.5B-Instruct"
@@ -30,6 +36,7 @@ GPUS_PER_NODE=$(nvidia-smi --list-gpus | wc -l)
 WORLD_SIZE=$GPUS_PER_NODE # 假设单节点，多节点需调整
 BATCH_SIZE=128
 MICRO_BATCH_SIZE=4
+EPOCH=20
 GRAD_ACCU=$(($BATCH_SIZE / $WORLD_SIZE / $MICRO_BATCH_SIZE))
 
 # --- 执行 ---
@@ -44,18 +51,17 @@ http_proxy=127.0.0.1:7890 https_proxy=127.0.0.1:7890 torchrun \
     --master_port 6105 \
     train.py \
     --model_name_or_path ${PRETRAINED_MODEL} \
-    --data_path "$DATA_PATH" \
+    --data_path ${DATA_PATH} \
     --model_max_length 1280 \
-    --output_dir "${OUTPUT_DIR}" \
-    --num_train_epochs 10 \
+    --output_dir ${OUTPUT_DIR} \
+    --num_train_epochs ${EPOCH} \
     --per_device_train_batch_size ${MICRO_BATCH_SIZE} \
     --gradient_accumulation_steps ${GRAD_ACCU} \
-    --save_strategy "steps" \
-    --save_steps 100 \
+    --save_strategy "epoch" \
     --learning_rate 1e-4 \
-    --deepspeed "${DEEPSPEED_CONFIG}" \
+    --deepspeed ${DEEPSPEED_CONFIG} \
     --bf16 True \
     --use_peft True \
-    --peft_config_path "${PEFT_CONFIG_FOLDER}" \
-    --run_name $RUNNAME \
+    --peft_config_path ${PEFT_CONFIG_FOLDER} \
+    --run_name ${RUNNAME} \
     --report_to wandb
