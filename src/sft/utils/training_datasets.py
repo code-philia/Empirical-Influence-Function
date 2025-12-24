@@ -7,7 +7,7 @@ from typing import Dict, Optional, Sequence
 import transformers
 import logging
 import numpy as np
-import src.sft.utils.utils as utils
+from . import utils
 
 logging.basicConfig(level=logging.DEBUG)  
 class SupervisedDataset(Dataset):
