@@ -57,7 +57,8 @@ http_proxy=127.0.0.1:7890 https_proxy=127.0.0.1:7890 torchrun \
     --num_train_epochs ${EPOCH} \
     --per_device_train_batch_size ${MICRO_BATCH_SIZE} \
     --gradient_accumulation_steps ${GRAD_ACCU} \
-    --save_strategy "epoch" \
+    --save_strategy "steps" \
+    --save_steps 40 \
     --learning_rate 1e-4 \
     --logging_strategy "steps" \
     --logging_steps 1 \
