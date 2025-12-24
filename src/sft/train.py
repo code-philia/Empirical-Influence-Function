@@ -40,28 +40,6 @@ class TrainingArguments(transformers.TrainingArguments):
     use_peft: bool = field(default=False)
     peft_config_path: str = field(default=None)
 
-def smart_tokenizer_and_embedding_resize(
-    special_tokens_dict: Dict,
-    tokenizer: transformers.PreTrainedTokenizer,
-    model: transformers.PreTrainedModel,
-):
-    """Resize tokenizer and embedding.
-
-    Note: This is the unoptimized version that may make your embedding size not be divisible by 64.
-    """
-    num_new_tokens = tokenizer.add_special_tokens(special_tokens_dict)
-    model.resize_token_embeddings(len(tokenizer))
-
-    if num_new_tokens > 0:
-        input_embeddings = model.get_input_embeddings().weight.data
-        output_embeddings = model.get_output_embeddings().weight.data
-
-        input_embeddings_avg = input_embeddings[:-num_new_tokens].mean(dim=0, keepdim=True)
-        output_embeddings_avg = output_embeddings[:-num_new_tokens].mean(dim=0, keepdim=True)
-
-        input_embeddings[-num_new_tokens:] = input_embeddings_avg
-        output_embeddings[-num_new_tokens:] = output_embeddings_avg
-
 
 def _tokenize_fn(strings: Sequence[str], tokenizer: transformers.PreTrainedTokenizer) -> Dict:
     """Tokenize a list of strings."""
@@ -114,7 +92,12 @@ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer, arg
     elif args.data_path.endswith(".mmap"):
         train_dataset = training_datasets.MMAPSupervisedDataset(tokenizer=tokenizer, data_path=args.data_path, args=args)
     data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
-    return dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)
+
+    return dict(
+        train_dataset=train_dataset,
+        eval_dataset=None,
+        data_collator=data_collator
+    )
 
 
 def is_master():
@@ -207,6 +190,7 @@ def train():
     args = {**model_args.__dict__, **data_args.__dict__, **training_args.__dict__}
     args = argparse.Namespace(**args)
     #logging.info(args)
+
     model = transformers.AutoModelForCausalLM.from_pretrained(
         model_args.model_name_or_path,
         cache_dir=training_args.cache_dir,
@@ -218,6 +202,7 @@ def train():
         model.enable_input_require_grads()
         model = get_peft_model(model, peft_config)
         model.print_trainable_parameters()
+
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         model_args.model_name_or_path,
         pad_token = '<|endoftext|>',
@@ -230,6 +215,7 @@ def train():
     )
     tokenizer.add_special_tokens({"additional_special_tokens": ["<|im_end|>", "<|im_start|>"]})
     data_module = make_supervised_data_module(tokenizer=tokenizer, args=args)
+
     #trainer = CustomTrainer(
     trainer = Trainer(
         model=model, 

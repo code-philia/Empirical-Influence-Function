@@ -52,12 +52,12 @@ chmod +x ./sft_qwencoder_with_lora.sh
 ./sft_qwencoder_with_lora.sh
 ```
 
-The adapter will be saved under ```src/sft/checkpoints```.
+The adapter will be saved under ```src/sft/scripts/checkpoints```.
 
 ## Step 4: Merge LoRA Adapter into a Full Model Checkpoint
 
 ```bash
-python -m src.sft.merge_adapter --base_model_path Qwen/Qwen2.5-Coder-1.5B-Instruct --train_adapters_path ./src/sft/checkpoints --output_path ./src/sft/checkpoint-full
+python -m src.sft.merge_adapter --base_model_path Qwen/Qwen2.5-Coder-1.5B-Instruct --train_adapters_path ./src/sft/scripts/checkpoints --output_path ./src/sft/scripts/checkpoint-full
 ```
 
 ## Step 5: Test the Trained Model on Some Samples

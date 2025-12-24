@@ -27,8 +27,8 @@ echo "--"
 PRETRAINED_MODEL="Qwen/Qwen2.5-Coder-1.5B-Instruct"
 RUNNAME="1k-sft"
 export NCCL_DEBUG=WARN
-export HF_HOME="/mnt/nvme0n1/hf_hub"
-export TRANSFORMERS_CACHE="/mnt/nvme0n1/hf_hub"
+export HF_HOME="/mnt/nvme0n1/hf_hub" # set to your huggingface cache dir
+export TRANSFORMERS_CACHE="/mnt/nvme0n1/hf_hub" # set to your huggingface cache dir
 export WANDB_PROJECT="EIF"
 
 # --- 显卡与并行设置 ---
@@ -59,6 +59,8 @@ http_proxy=127.0.0.1:7890 https_proxy=127.0.0.1:7890 torchrun \
     --gradient_accumulation_steps ${GRAD_ACCU} \
     --save_strategy "epoch" \
     --learning_rate 1e-4 \
+    --logging_strategy "steps" \
+    --logging_steps 1 \
     --deepspeed ${DEEPSPEED_CONFIG} \
     --bf16 True \
     --use_peft True \

@@ -10,7 +10,7 @@ def inference_samples(num_samples=5):
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # 1. 加载模型与分词器 (路径建议设为变量)
-    model_path = "./src/sft/checkpoint-full"
+    model_path = "./src/sft/scripts/checkpoint-full"
     print(f"Loading model from {model_path}...")
 
     tokenizer = AutoTokenizer.from_pretrained(model_path)
