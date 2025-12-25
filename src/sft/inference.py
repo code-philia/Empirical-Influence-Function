@@ -4,12 +4,50 @@ import argparse
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from .utils import training_datasets
+import textwrap
+
+class Color:
+    GREEN = '\033[92m'   # 绿色
+    BLUE = '\033[94m'    # 蓝色
+    CYAN = '\033[96m'    # 青色 (可选，用于 Index)
+    BOLD = '\033[1m'     # 加粗
+    END = '\033[0m'      # 重置颜色
 
 
-def inference_samples(num_samples=5):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+def print_side_by_side(gt_text, model_text, width=50):
+    """
+    将两条文本并排打印。
+    width: 每一列的字符宽度
+    """
+    # 1. 处理换行，确保每行不超过指定宽度
+    gt_lines = []
+    for line in gt_text.splitlines():
+        gt_lines.extend(textwrap.wrap(line, width=width) if line.strip() else [""])
 
-    # 1. 加载模型与分词器 (路径建议设为变量)
+    model_lines = []
+    for line in model_text.splitlines():
+        model_lines.extend(textwrap.wrap(line, width=width) if line.strip() else [""])
+
+    # 2. 补齐行数，使其对齐
+    max_len = max(len(gt_lines), len(model_lines))
+    gt_lines    += [""] * (max_len - len(gt_lines))
+    model_lines += [""] * (max_len - len(model_lines))
+
+    # 3. 打印标题
+    header_gt    = f"{Color.BOLD}{Color.GREEN}{'GROUND TRUTH'.center(width)}{Color.END}"
+    header_model = f"{Color.BOLD}{Color.BLUE}{'MODEL RESPONSE'.center(width)}{Color.END}"
+    print(f"\n{header_gt} | {header_model}")
+    print("-" * (width * 2 + 3))
+
+    # 4. 逐行并排打印
+    for gt, model in zip(gt_lines, model_lines):
+        # 使用 ljust 确保左侧列对齐
+        left_col  = f"{Color.GREEN}{gt.ljust(width)}{Color.END}"
+        right_col = f"{Color.BLUE}{model.ljust(width)}{Color.END}"
+        print(f"{left_col} | {right_col}")
+
+def inference_samples(num_samples):
+
     model_path = "./src/sft/scripts/checkpoint-full"
     print(f"Loading model from {model_path}...")
 
@@ -17,10 +55,9 @@ def inference_samples(num_samples=5):
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         device_map="auto",
-        torch_dtype=torch.bfloat16  # 推荐使用 bf16 节省显存且匹配训练
+        torch_dtype=torch.bfloat16
     ).eval()
 
-    # 2. 加载数据集
     dataset = training_datasets.SupervisedDataset(
         tokenizer=tokenizer,
         data_path="./sft-processed.jsonl",
@@ -30,21 +67,19 @@ def inference_samples(num_samples=5):
         })
     )
 
-    # 3. 随机采样索引
-    total_data = len(dataset)
+    total_data     = len(dataset)
     sample_indices = random.sample(range(total_data), min(num_samples, total_data))
     print(f"Total dataset size: {total_data}. Sampling {len(sample_indices)} cases...\n")
 
-    assistant_start_token = tokenizer.encode("<|im_start|>assistant", add_special_tokens=False)
+    # 编码识别符
+    assistant_start_token  = tokenizer.encode("<|im_start|>assistant", add_special_tokens=False)
     assistant_start_tensor = torch.tensor(assistant_start_token)
 
-    # 4. 循环生成
     for idx in sample_indices:
         data_item = dataset[idx]
         input_ids_full = data_item["input_ids"]
 
-        # 定位 <|im_start|>assistant 的位置以截断 Prompt
-        # 这种逻辑确保我们只给模型看 Prompt 部分
+        # 1. 寻找切分点
         break_idx = -1
         for i in range(len(input_ids_full) - len(assistant_start_tensor) + 1):
             if torch.equal(input_ids_full[i:i + len(assistant_start_tensor)], assistant_start_tensor):
@@ -52,32 +87,44 @@ def inference_samples(num_samples=5):
                 break
 
         if break_idx == -1:
-            print(f"Warning: Assistant start token not found in sample {idx}")
             continue
 
-        prompt_ids = input_ids_full[:break_idx].unsqueeze(0).to(model.device)
-
-        # 解码 Prompt 用于打印查看 (剔除特殊 token 让控制台更整洁)
+        # 2. 提取 Prompt
+        prompt_ids      = input_ids_full[:break_idx].unsqueeze(0).to(model.device)
         readable_prompt = tokenizer.decode(prompt_ids[0], skip_special_tokens=False)
 
+        # 3. 提取 Ground Truth (从 break_idx 到末尾，忽略填充部分)
+        # 在 SupervisedDataset 中，labels 之外通常是 -100，input_ids 则是对应的 token
+        # 我们直接从原始 input_ids 中截取后半部分
+        gt_ids = input_ids_full[break_idx:]
+        # 过滤掉可能的 padding (假设 pad_token_id 存在)
+        if tokenizer.pad_token_id is not None:
+            gt_ids = gt_ids[gt_ids != tokenizer.pad_token_id]
+        # 过滤掉结束符以保持清洁
+        gt_text = tokenizer.decode(gt_ids, skip_special_tokens=True).strip()
+
+        # 4. 模型生成
         with torch.no_grad():
             generated_ids = model.generate(
                 prompt_ids,
-                max_new_tokens=512,  # 采样时可以先设小一点观察效果
-                eos_token_id=tokenizer.eos_token_id
+                max_new_tokens=512,
+                eos_token_id=tokenizer.eos_token_id,
+                pad_token_id=tokenizer.pad_token_id
             )
 
-        # 截断掉输入的 Prompt 部分，只留生成的回答
         response_ids = generated_ids[0][prompt_ids.shape[-1]:]
-        response_text = tokenizer.decode(response_ids, skip_special_tokens=True)
+        response_text = tokenizer.decode(response_ids, skip_special_tokens=True).strip()
 
-        # 5. 结构化打印 (ISTJ 风格：清晰、有分隔符)
-        print("-" * 50)
-        print(f"【Sample Index】: {idx}")
+        # 5. 结构化打印对比
+        print("=" * 60)
+        print(f"{Color.BOLD}【Sample Index】: {idx}{Color.END}")
         print(f"【Input Prompt】:\n{readable_prompt}")
-        print(f"\n【Model Response】:\n{response_text}")
-        print("-" * 50 + "\n")
+        print("-" * 30)
+
+        print_side_by_side(gt_text, response_text, width=60)
+
+        print("=" * 60 + "\n")
 
 
 if __name__ == "__main__":
-    inference_samples(num_samples=3)  # 这里修改你想查看的数量
+    inference_samples(num_samples=10)

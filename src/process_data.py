@@ -52,17 +52,27 @@ class CustomCollator:
 
         return batch
 
+
+
 def extract_code_content(text):
-    text = text.replace("This is a go programming task on some code contents. Given task: The task is to fill in the missing part of a go function according to the provided code   content. ", "")
-    pattern = r"And here is the function you are asked to complete\s*([\s\S]*) Ensure that only missing codes marked as <MID> are returned"
+    # 1. 提取结构体定义 (这是模型推导逻辑的关键)
+    # 匹配从 "The receiver struct definitions" 开始到 "// Methods:" 或者 "The parameter struct" 之前
+    struct_pattern = r"The receiver struct definitions of the function is ([\s\S]*?)(?=(// Methods:|The parameter struct))"
+    struct_match = re.search(struct_pattern, text)
+    struct_content = struct_match.group(1).strip() if struct_match else ""
 
-    match = re.search(pattern, text)
+    # 2. 提取目标任务 (你原有的逻辑)
+    task_pattern = r"And here is the function you are asked to complete\s*([\s\S]*) Ensure that only missing codes marked as <MID> are returned"
+    task_match = re.search(task_pattern, text)
+    task_content = task_match.group(1).strip() if task_match else ""
 
-    if match:
-        extracted_part = match.group(1)
-        return extracted_part.strip()
-    else:
-        return text
+    # 3. 组合成精简但逻辑完整的 Prompt
+    if struct_content and task_content:
+        # 保持格式整洁，方便模型理解
+        return f"## The receiver struct definitions of the function is:\n```go\n{struct_content}\n```\n\n " \
+               f"## The function to be completed is:\n```go\n{task_content}\n```"
+
+    return task_content if task_content else text
 
 def strip_text_output(text):
     reformated_text = text.lstrip().replace("\t", "").strip()

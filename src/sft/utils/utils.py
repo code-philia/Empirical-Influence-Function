@@ -259,7 +259,7 @@ def read_json_file(path):
     return objs
     
 def write_jsonl_file(objs, path, chunk_size = 1):
-    os.makedirs(os.path.dirname(path), exist_ok = True)
+    # os.makedirs(os.path.dirname(path), exist_ok = True)
     with jsonlines.open(path, "w", flush=True) as w:
         for i in tqdm.tqdm(range(0, len(objs), chunk_size)):
             w.write_all(objs[i: i + chunk_size])

@@ -2,7 +2,7 @@
 import json
 from ..process_data import extract_code_content, strip_text_output
 
-JSONL_PATH  = "small_data.jsonl"  # 请确保文件存在
+JSONL_PATH  = "big_data.jsonl"  # 请确保文件存在
 OUTPUT_PATH = "sft.jsonl"
 train_texts = []
 with open(JSONL_PATH, 'r', encoding='utf-8') as f:

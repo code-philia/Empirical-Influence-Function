@@ -20,7 +20,8 @@ import re
 import shutil
 import re
 from process_data import *
-from loss import compute_loss_per_sample, compute_independent_sliding_loss_scalar, compute_gradients
+from loss import compute_loss_per_sample, compute_gradients
+import gc
 
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
@@ -67,28 +68,33 @@ def generate_response(model, tokenizer, input_ids, device):
 
 
 class EmpiricalIF:
-    def __init__(self, dl_train, model, tokenizer, accelerator, param_filter_fn=None):
+    def __init__(self, dl_train, model, tokenizer, accelerator, param_filter_fn=None, debug_on=False):
         self.dl_train = dl_train
         self.model = model
         self.tokenizer = tokenizer
-        self.accelerator = accelerator  # 传入 accelerator 实例
+        self.accelerator = accelerator
         self.device = accelerator.device
         self.param_filter_fn = param_filter_fn
-        # self.ignored_token_ids = get_ignored_token_ids(tokenizer).long().to(self.device)
-        self.ignored_token_ids = torch.tensor([]).to(self.device)
+        self.ignored_token_ids = torch.tensor([], device=self.device)
+        self.debug_on = debug_on
 
-        # 缓存训练数据 (Cache)
+        # 1. 缓存训练数据至 CPU，防止显存占用过多
         self.train_batches = []
         if self.accelerator.is_main_process:
-            logger.info("Caching training data (distributed shards)...")
+            logger.info("Step 1: Caching training shards to CPU...")
         for batch in self.dl_train:
-            # 移回 CPU 节省显存，计算时再挪到 GPU
             batch_cpu = {k: v.cpu() for k, v in batch.items() if isinstance(v, torch.Tensor)}
             self.train_batches.append(batch_cpu)
 
-        local_count = sum(len(b['input_ids']) for b in self.train_batches)
-        logger.info(
-            f"[Rank {self.accelerator.process_index}] Cached {len(self.train_batches)} batches ({local_count} samples).")
+        # 2. 预计算 Train Base Losses (一次性任务)
+        if self.accelerator.is_main_process:
+            logger.info("Step 2: Pre-calculating Train Base Losses (Global Reference)...")
+        # 这里计算的是该进程负责的那部分样本的 base loss
+        self.base_train_results = self._get_train_losses()
+
+        # 清理一次初始化产生的碎片
+        gc.collect()
+        torch.cuda.empty_cache()
 
     @staticmethod
     def get_param_snapshot(model: nn.Module, param_filter_fn: Optional[ParamFilterFn]) -> List[torch.Tensor]:
@@ -124,39 +130,34 @@ class EmpiricalIF:
                         param.data -= lr * grad_device
                     idx += 1
 
-    def _get_train_losses(self, with_generation: bool):
-        all_sum_losses, all_indices, tokenwise_dict, all_generated_dict = [], [], {}, {}
+    def _get_train_losses(self):
+        """内部方法：计算当前进程分片内所有样本的 Loss"""
+        all_sum_losses, all_indices, tokenwise_dict = [], [], {}
         self.model.eval()
+
         with torch.no_grad():
             for batch in self.train_batches:
                 batch_gpu = {k: v.to(self.device) for k, v in batch.items()}
-                mean_loss, token_loss = compute_loss_per_sample(self.model, batch_gpu, self.device,
-                                                                self.ignored_token_ids)
+                mean_loss, token_loss = compute_loss_per_sample(self.model, batch_gpu, self.device, self.ignored_token_ids)
 
-                # 获取 shift_labels 用于对齐
-                # shift_labels 的形状与 token_loss 相同: [batch_size, seq_len - 1]
                 shift_labels = batch_gpu["labels"][..., 1:].contiguous()
                 indices = batch_gpu["sample_index"].cpu().tolist()
 
                 for i, idx in enumerate(indices):
-                    valid_indices = torch.where(shift_labels[i] != -100)[0]
-                    if len(valid_indices) > 0:
-                        start_idx = valid_indices[0]
-                        tokenwise_dict[idx] = token_loss[i][start_idx:].cpu() # 这样得到的 diffs 序列就只包含 Response 部分了，能与可视化对齐
+                    # 仅保留 Response 部分的 Loss 用于可视化
+                    valid_mask = (shift_labels[i] != -100)
+                    if valid_mask.any():
+                        start_idx = torch.where(valid_mask)[0][0]
+                        tokenwise_dict[idx] = token_loss[i][start_idx:].cpu()
                     else:
-                        # 这种情况不应该发生，除非 label 全是 -100
-                        tokenwise_dict[idx] = torch.tensor([])
-
-                    if with_generation:
-                        generated_res = generate_response(self.model, self.tokenizer, batch_gpu["input_ids"][i], self.device)
-                        all_generated_dict[idx] = generated_res
+                        tokenwise_dict[idx] = torch.tensor([], device='cpu')
 
                 all_sum_losses.append(mean_loss)
                 all_indices.append(batch_gpu["sample_index"])
 
-        return torch.cat(all_sum_losses), torch.cat(all_indices), tokenwise_dict, all_generated_dict
+        return torch.cat(all_sum_losses), torch.cat(all_indices), tokenwise_dict
 
-    def query_influence(self, query_batch: BatchDict, lr: float = 1e-2, max_steps: int = 1000, loss_threshold: float = 1e-4, debug_on: bool = False):
+    def query_influence(self, query_batch: BatchDict, lr: float = 1e-2, max_steps: int = 1000, loss_threshold: float = 1e-4):
         if self.accelerator.is_main_process:
             logger.info("Computing Influence Function...")
 
@@ -169,90 +170,82 @@ class EmpiricalIF:
             )
             l_test_base = l_test_base_scalar.item()
 
-            # --- Query 对齐逻辑 ---
-            shift_labels_query = query_batch["labels"][..., 1:].contiguous()
-            valid_indices_q    = torch.where(shift_labels_query[0] != -100)[0]
-
-            if len(valid_indices_q) > 0:
-                start_idx_q = valid_indices_q[0]
-                l_test_base_tokenwise = l_test_base_tokenwise_raw[0][start_idx_q:].cpu()
-            else:
-                l_test_base_tokenwise = torch.zeros_like(l_test_base_tokenwise_raw[0]).cpu()
+            # 对齐 Query 的 Token-level diffs
+            shift_labels_q = query_batch["labels"][..., 1:].contiguous()
+            valid_q = (shift_labels_q[0] != -100)
+            start_q = torch.where(valid_q)[0][0] if valid_q.any() else 0
+            l_test_base_tokenwise = l_test_base_tokenwise_raw[0][start_q:].cpu()
 
         if self.accelerator.is_main_process:
             logger.info(f"Initial Testing Loss = {l_test_base}...")
-
-        # ================== 2. 计算 Train Base Losses ==================
-        l_train_base_sum, indices_local, l_train_base_tokenwise, train_base_generated_dict = self._get_train_losses(with_generation=debug_on)
 
         # 备份参数
         snapshot = self.get_param_snapshot(self.model, self.param_filter_fn)
 
         # ================== 3. 在 Query 上执行梯度下降 ==================
-        current_test_loss = l_test_base
-        for steps_taken in range(max_steps):
-            if current_test_loss < loss_threshold:
+        # 3. 对 Query 执行梯度下降 (扰动)
+        curr_test_loss = l_test_base
+        for step in range(max_steps):
+            if curr_test_loss < loss_threshold:
                 break
-            grads = compute_gradients(self.model, query_batch, self.param_filter_fn, self.device, self.ignored_token_ids, self.tokenizer)
+
+            # 使用加速后的梯度计算
+            grads = compute_gradients(self.model, query_batch, self.param_filter_fn, self.device, self.ignored_token_ids)
             self.apply_gradient_update(self.model, grads, self.param_filter_fn, lr=lr)
 
             with torch.no_grad():
-                # 只用于检查停止条件，不需要 token-level
-                loss_scalar, _ = compute_loss_per_sample(self.model, query_batch, self.device, self.ignored_token_ids)
-                current_test_loss = loss_scalar.item()
+                loss_s, _ = compute_loss_per_sample(self.model, query_batch, self.device, self.ignored_token_ids)
+                curr_test_loss = loss_s.item()
 
             if self.accelerator.is_main_process:
-                logger.info(f"Gradient Descent for {steps_taken} Steps, the Testing Loss Decreased to {current_test_loss}...")
+                logger.info(f"Gradient Descent for {step} Steps, the Testing Loss Decreased to {curr_test_loss}...")
 
         # ================== 4. 计算 Query Descent Loss (含 Token-level) ==================
-        # L_test'
         with torch.no_grad():
-            _, l_test_des_tokenwise_raw = compute_loss_per_sample(
-                self.model, query_batch, self.device, self.ignored_token_ids
-            )
-            # --- Query 对齐逻辑 (同上) ---
-            if len(valid_indices_q) > 0:
-                start_idx_q = valid_indices_q[0]
-                l_test_des_tokenwise = l_test_des_tokenwise_raw[0][start_idx_q:].cpu()
-            else:
-                l_test_des_tokenwise = torch.zeros_like(l_test_des_tokenwise_raw[0]).cpu()
+            _, l_test_des_tokenwise_raw = compute_loss_per_sample(self.model, query_batch, self.device,
+                                                                  self.ignored_token_ids)
+            l_test_des_tokenwise = l_test_des_tokenwise_raw[0][start_q:].cpu()
 
-        # ================== 5. 计算 Query Token Diffs ==================
         query_token_diffs = l_test_des_tokenwise - l_test_base_tokenwise
+        delta_test = curr_test_loss - l_test_base
 
         # ================== 6. 计算 Train Descent Losses ==================
-        l_train_des_sum, _, l_train_des_tokenwise, train_des_generated_dict = self._get_train_losses(with_generation=debug_on)
+        l_train_des_sum, _, l_train_des_tokenwise = self._get_train_losses()
 
         # 恢复参数
         self.restore_params(self.model, snapshot, self.param_filter_fn)
 
         # ================== 7. 计算最终分数 ==================
-        delta_test = current_test_loss - l_test_base
+        l_train_base_sum, indices_local, l_train_base_tokenwise = self.base_train_results
 
-        local_token_diffs = {}
-        local_scores_list = []
-
+        local_scores = []
+        local_diffs = {}
         for i, idx in enumerate(indices_local.tolist()):
-            base_s = l_train_base_sum[i].item()
-            des_s  = l_train_des_sum[i].item()
+            # 核心计算：Query 的 Loss 变化 * 训练样本的 Loss 变化
+            rel_delta_train = l_train_des_sum[i].item() - l_train_base_sum[i].item()
+            denom = l_train_base_sum[i].item() + 1e-8
+            normalized_score = delta_test * (rel_delta_train / denom)  # 关注符号而非绝对大小
+            local_scores.append(normalized_score)
+            local_diffs[idx] = (l_train_des_tokenwise[idx] - l_train_base_tokenwise[idx])
 
-            # Relative Change
-            rel_delta_train = (des_s - base_s)
-            score = delta_test * rel_delta_train
-            local_scores_list.append(score)
-            local_token_diffs[idx] = (l_train_des_tokenwise[idx] - l_train_base_tokenwise[idx])
-
-        all_scores  = self.accelerator.gather(torch.tensor(local_scores_list, device=self.device))
+        # 8. 全局通信汇总
+        all_scores  = self.accelerator.gather(torch.tensor(local_scores, device=self.device))
         all_indices = self.accelerator.gather(indices_local)
-        all_dicts   = gather_object([local_token_diffs])
+        all_diffs_list = gather_object([local_diffs])
 
         global_train_diffs = {}
         if self.accelerator.is_main_process:
-            for d in all_dicts:
+            for d in all_diffs_list:
                 global_train_diffs.update(d)
 
+        # 9. 显存清理：彻底释放中间变量
+        del snapshot, grads, l_train_des_sum, l_train_des_tokenwise
+        gc.collect()
+        torch.cuda.empty_cache()
+
         # 返回四个值：Scores, Indices, Train Diffs, Query Diffs
-        return all_scores.tolist(), all_indices.tolist(), global_train_diffs, query_token_diffs, train_base_generated_dict, train_des_generated_dict
+        return all_scores.tolist(), all_indices.tolist(), \
+               global_train_diffs, query_token_diffs
 
 
 def save_query_report_html(
@@ -265,16 +258,41 @@ def save_query_report_html(
         tokenizer: AutoTokenizer,
         train_token_diffs_dict: Dict[int, torch.Tensor],
         query_token_diffs: torch.Tensor,
-        train_base_generated_dict: Dict[int, str], # 新增
-        train_des_generated_dict: Dict[int, str],  # 新增
         top_5_harmful_indices: List[int],  # 新增：Top 5 有害样本的索引列表
         top_5_harmful_scores: List[float],  # 新增：Top 5 有害样本的分数列表
         top_5_helpful_indices: List[int],  #
         top_5_helpful_scores: List[float],  #
-        output_dir: str = "reports"
+        model: nn.Module,
+        param_filter_fn,
+        lr,
+        max_steps,
+        output_dir: str = "reports",
 ):
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
+
+    def get_gen_results(indices):
+        results = {}
+        model.eval()
+        for idx in indices:
+            sample = train_dataset[idx]
+            results[idx] = generate_response(model, tokenizer, sample["input_ids"], model.device)
+        return results
+
+    all_indices = [query_idx] + top_5_helpful_indices + top_5_harmful_indices
+    logger.info(f"Generating 'Before' responses for query {query_idx}...")
+    before_gens = get_gen_results(all_indices)
+
+    # 临时重演扰动
+    snapshot = EmpiricalIF.get_param_snapshot(model, param_filter_fn)
+    model.eval()
+    for _ in range(max_steps):
+        grads = compute_gradients(model, query_batch, param_filter_fn, model.device, torch.tensor([], device=model.device))
+        EmpiricalIF.apply_gradient_update(model, grads, param_filter_fn, lr=lr)
+
+    logger.info(f"Generating 'After' responses for query {query_idx}...")
+    after_gens = get_gen_results(all_indices)
+    EmpiricalIF.restore_params(model, snapshot, param_filter_fn)
 
     # --- 内部辅助函数：根据 input_ids 和 diffs 生成着色 HTML ---
     def get_colored_html_from_ids(input_ids: torch.Tensor, diffs_tensor: Optional[torch.Tensor] = None):
@@ -342,8 +360,8 @@ def save_query_report_html(
             colored_code = get_colored_html_from_ids(sample_data["input_ids"].cpu(), train_token_diffs_dict.get(idx))
 
             # 直接从传入的字典获取生成结果
-            base_gen = train_base_generated_dict.get(idx, "No generation found")
-            des_gen  = train_des_generated_dict.get(idx,  "No generation found")
+            base_gen = before_gens.get(idx, "No generation found")
+            des_gen  = after_gens.get(idx,  "No generation found")
 
             # 提取 Input Snippet
             full_text     = tokenizer.decode(sample_data["input_ids"], skip_special_tokens=True)
@@ -352,8 +370,8 @@ def save_query_report_html(
             html_template += f"""
             <div class="card">
                 <h3>Index {idx} (Score: {h_score:.6e})</h3>
-                <span class="label">Input:</span> <pre style="background: #eee; color: #333;">{input_snippet[:500]}</pre>
-                <span class="label">Ground Truth (Colored by Influence):</span> <div class="code-box">{colored_code}</div>
+                <span class="label">Input:</span> <pre style="background: #eee; color: #333;">{input_snippet}</pre>
+                <span class="label">Ground Truth:</span> <div class="code-box">{colored_code}</div>
 
                 <span class="label">Generation Comparison:</span>
                 <div class="gen-container">
@@ -431,6 +449,7 @@ def save_query_report_html(
     with open(f"{output_dir}/query_{query_idx}.html", "w", encoding="utf-8") as f:
         f.write(html_template)
 
+
 def main():
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
@@ -438,7 +457,7 @@ def main():
 
     # 路径配置
     JSONL_PATH = "/home/ruofan/git_space/Empirical-Influence-Function/sft.jsonl"  # 请确保文件存在
-    MODEL_ID = "/home/ruofan/git_space/Empirical-Influence-Function/src/sft/checkpoint-full"
+    MODEL_ID   = "/home/ruofan/git_space/Empirical-Influence-Function/src/sft/scripts/checkpoint-full"
     RESULTS_JSON_PATH = "/home/ruofan/git_space/Empirical-Influence-Function/experiment_results.jsonl"
 
     accelerator = Accelerator()
@@ -446,12 +465,6 @@ def main():
 
     if accelerator.is_main_process:
         logger.info(f"Processes: {accelerator.state.num_processes}")
-
-    # Load Tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "right"
 
     # Load Model
     # 注意：在多卡环境下，显式指定 device_map={"": device} 有助于避免 Accelerate 自动分配冲突
@@ -461,21 +474,29 @@ def main():
         torch_dtype=torch.bfloat16,
         trust_remote_code=True
     )
+    # Load Tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "right"
 
-    # Clone Head for Independent Optimization
-    model.lm_head.weight = nn.Parameter(model.model.embed_tokens.weight.detach().clone())
-    model.config.tie_word_embeddings = False
+    # target_layer_keyword =
+    # model.lm_head.weight = nn.Parameter(model.model.embed_tokens.weight.detach().clone())
+    # model.config.tie_word_embeddings = False
 
     # Freeze & Unfreeze
-    target_layer_keyword = "lm_head"
+    target_layer_keywords = ["model.layers.27", "embed_tokens"]
     for param in model.parameters():
         param.requires_grad = False
     for name, param in model.named_parameters():
-        if target_layer_keyword in name:
+        if any(key in name for key in target_layer_keywords):
             param.requires_grad = True
 
+    if model.lm_head.weight.requires_grad:
+        logger.info("Weight Tying confirmed: lm_head is automatically unfrozen via embed_tokens.")
+
     def filter_params(n, p):
-        return target_layer_keyword in n and p.requires_grad
+        return any(key in n for key in target_layer_keywords) and p.requires_grad
 
     # Load Data
     train_texts = []
@@ -493,11 +514,13 @@ def main():
                     train_texts.append(
                         {
                             'system': sys,
-                            'input': inp,
+                            'input':  inp,
                             'output': outp
                         }
                     )
                     seen_inputs.add(inp)
+            if len(train_texts) >= 1000:
+                break
 
     test_texts = []
     for idx in range(len(train_texts)):
@@ -509,6 +532,8 @@ def main():
                 "output": train_texts[perturbed_idx]["output"],
             }
         )
+        if len(test_texts) >= 100:
+            break
 
     # Dataset Preparation
     process_func = partial(process_func_chatml, tokenizer=tokenizer)
@@ -527,7 +552,7 @@ def main():
     )
     collator = CustomCollator(base_collator)
 
-    BATCH_SIZE = 1
+    BATCH_SIZE = 6
     train_loader = DataLoader(
         train_ds,
         batch_size=BATCH_SIZE,
@@ -536,10 +561,12 @@ def main():
     )
 
     # Prepare DataLoader
-    train_loader = accelerator.prepare(train_loader)
+    train_loader  = accelerator.prepare(train_loader)
     total_samples = len(train_texts)
 
-    eif = EmpiricalIF(train_loader, model, tokenizer, accelerator, filter_params)
+    eif = EmpiricalIF(train_loader, model, tokenizer, accelerator, filter_params,
+                      # debug_on=True)
+                      debug_on=False)
 
     self_ranks = []
     if accelerator.is_main_process:
@@ -548,6 +575,14 @@ def main():
         logger.info(f"Results will be streamed to {RESULTS_JSON_PATH}")
 
     for i in tqdm(range(len(test_texts)), desc="Running Experiments"):
+
+        # if i not in [7, 21, 32, 86, 37,
+        #              38, 29, 42, 60]:
+        #     continue
+
+        # if i not in [3 ,13, 16, 14, 28, 35, 24
+        # ]:
+        #     continue
 
         test_sample_dict = test_texts[i]
 
@@ -565,8 +600,8 @@ def main():
 
         # 运行 Influence Analysis
         # lr 可以适当大一点，因为我们只更新很少的步数
-        scores, indices, global_train_diffs, query_token_diffs, train_base_generated_dict, train_des_generated_dict = eif.query_influence(
-            query_batch, lr=1e-3, max_steps=50, loss_threshold=0.01, debug_on=False
+        scores, indices, global_train_diffs, query_token_diffs = eif.query_influence(
+            query_batch, lr=5e-4, max_steps=10, loss_threshold=0.6
         )
 
         if accelerator.is_main_process:
@@ -599,7 +634,7 @@ def main():
             with open(RESULTS_JSON_PATH, "a", encoding="utf-8") as f:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
-            # # 准备 Top 5 Harmful 数据
+            # # # 准备 Top 5 Harmful 数据
             # top_5_harmful = sorted_results[-5:][::-1]
             # top_5_indices = [idx for idx, score in top_5_harmful]
             # top_5_scores = [score for idx, score in top_5_harmful]
@@ -619,16 +654,19 @@ def main():
             #     tokenizer=tokenizer,
             #     train_token_diffs_dict=global_train_diffs,
             #     query_token_diffs=query_token_diffs,
-            #     train_base_generated_dict=train_base_generated_dict, # 传入
-            #     train_des_generated_dict=train_des_generated_dict,   # 传入
             #     top_5_harmful_indices=top_5_indices,  # Top 5 索引
             #     top_5_harmful_scores=top_5_scores,  # Top 5 分数
             #     top_5_helpful_indices=top_5_helpful_indices,  # Top 5 索引
             #     top_5_helpful_scores=top_5_helpful_scores,  # Top 5 分数
-            #     output_dir="influence_reports"
+            #     output_dir="influence_reports",
+            #     # output_dir="influence_reports_good",
+            #     lr=1e-3,
+            #     max_steps=20,
+            #     model=model,
+            #     param_filter_fn=filter_params
             # )
 
-            if i % 10 == 0:
+            if i % 5 == 0:
                 # 转换为 numpy 数组方便计算
                 ranks_arr = np.array(self_ranks)
 
@@ -639,7 +677,7 @@ def main():
 
                 print("\n" + "=" * 60)
                 print("🧪 EXPERIMENT REPORT: Mismatched Query (Self-Input + Other-Output)")
-                print(f"Target Layer         : {target_layer_keyword}")
+                print(f"Target Layer         : {target_layer_keywords}")
                 print(f"Total Samples Tested : {len(self_ranks)}")
                 print("-" * 60)
                 print(f"📉 Min Rank          : {min_rank:.0f}")
@@ -663,7 +701,7 @@ def main():
 
         print("\n" + "=" * 60)
         print("🧪 EXPERIMENT REPORT: Mismatched Query (Self-Input + Other-Output)")
-        print(f"Target Layer         : {target_layer_keyword}")
+        print(f"Target Layer         : {target_layer_keywords}")
         print(f"Total Samples Tested : {len(self_ranks)}")
         print("-" * 60)
         print(f"📉 Min Rank          : {min_rank:.0f}")
@@ -674,6 +712,6 @@ def main():
 if __name__ == '__main__':
     main()
 
-    #
+    # CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 accelerate launch --num_processes 8 IF_HF.py
 
 

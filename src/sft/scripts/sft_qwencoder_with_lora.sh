@@ -36,7 +36,7 @@ GPUS_PER_NODE=$(nvidia-smi --list-gpus | wc -l)
 WORLD_SIZE=$GPUS_PER_NODE # 假设单节点，多节点需调整
 BATCH_SIZE=128
 MICRO_BATCH_SIZE=4
-EPOCH=20
+EPOCH=4
 GRAD_ACCU=$(($BATCH_SIZE / $WORLD_SIZE / $MICRO_BATCH_SIZE))
 
 # --- 执行 ---
@@ -58,8 +58,9 @@ http_proxy=127.0.0.1:7890 https_proxy=127.0.0.1:7890 torchrun \
     --per_device_train_batch_size ${MICRO_BATCH_SIZE} \
     --gradient_accumulation_steps ${GRAD_ACCU} \
     --save_strategy "steps" \
-    --save_steps 40 \
+    --save_steps 100 \
     --learning_rate 1e-4 \
+    --max_grad_norm 1.0 \
     --logging_strategy "steps" \
     --logging_steps 1 \
     --deepspeed ${DEEPSPEED_CONFIG} \
