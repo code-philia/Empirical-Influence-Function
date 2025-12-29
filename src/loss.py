@@ -21,12 +21,11 @@ import torch
 import random
 from typing import Optional, Dict, List
 
-def compute_loss_per_sample(model, batch, device, ignored_token_ids):
+def compute_loss_per_sample(model, batch, device):
     """
     核心 Loss 计算 (优化版)：
     直接修改 labels 为 -100 来屏蔽 loss。
     """
-    ignored_token_ids = ignored_token_ids.to(device)
     inputs = {k: v.to(device) for k, v in batch.items() if k in ['input_ids', 'attention_mask', 'labels']}
     outputs = model(**inputs, return_dict=True)
     logits = outputs.logits.float()
@@ -34,13 +33,6 @@ def compute_loss_per_sample(model, batch, device, ignored_token_ids):
     # 1. 进行错位
     shift_logits = logits[..., :-1, :].contiguous()
     shift_labels = inputs["labels"][..., 1:].contiguous().clone()  # clone 一份，避免修改原始数据
-
-    # 2. 找出 shift_labels 中属于需要忽略的 token 的位置
-    mask_to_ignore = torch.isin(shift_labels, ignored_token_ids)
-
-    # 3. 将这些位置的 label 直接修改为 -100
-    shift_labels[mask_to_ignore] = -100
-    # ============================================
 
     # 4. 计算 Loss
     # reduction='none' 确保返回的是每个 token 的 loss
@@ -70,13 +62,12 @@ def compute_gradients(
         batch,
         param_filter_fn,
         device,
-        ignored_token_ids,
 ):
     model.eval()
     model.zero_grad(set_to_none=True)
     with torch.set_grad_enabled(True):
         #     # 使用原始 Loss
-        mean_loss,_   = compute_loss_per_sample(model, batch, device, ignored_token_ids)
+        mean_loss,_   = compute_loss_per_sample(model, batch, device)
         loss = mean_loss.mean()
 
         # 核心优化：只提取需要更新的参数（如 lm_head）
