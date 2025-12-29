@@ -22,7 +22,6 @@ import re
 from process_data import *
 from loss import compute_loss_per_sample, compute_gradients
 import gc
-
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
 # 配置日志
@@ -92,10 +91,6 @@ class EmpiricalIF:
         # 这里计算的是该进程负责的那部分样本的 base loss
         self.base_train_results = self._get_train_losses()
 
-        # 清理一次初始化产生的碎片
-        gc.collect()
-        torch.cuda.empty_cache()
-
     @staticmethod
     def get_param_snapshot(model: nn.Module, param_filter_fn: Optional[ParamFilterFn]) -> List[torch.Tensor]:
         snapshot = []
@@ -138,7 +133,7 @@ class EmpiricalIF:
         with torch.no_grad():
             for batch in self.train_batches:
                 batch_gpu = {k: v.to(self.device) for k, v in batch.items()}
-                mean_loss, token_loss = compute_loss_per_sample(self.model, batch_gpu, self.device, self.ignored_token_ids)
+                mean_loss, token_loss = compute_loss_per_sample(self.model, batch_gpu, self.device)
 
                 shift_labels = batch_gpu["labels"][..., 1:].contiguous()
                 indices = batch_gpu["sample_index"].cpu().tolist()
@@ -158,6 +153,12 @@ class EmpiricalIF:
         return torch.cat(all_sum_losses), torch.cat(all_indices), tokenwise_dict
 
     def query_influence(self, query_batch: BatchDict, lr: float = 1e-2, max_steps: int = 1000, loss_threshold: float = 1e-4):
+
+        if self.base_train_results is None:
+            self.base_train_results = self._get_train_losses()
+            gc.collect()
+            torch.cuda.empty_cache()
+
         if self.accelerator.is_main_process:
             logger.info("Computing Influence Function...")
 
@@ -166,7 +167,7 @@ class EmpiricalIF:
         # ================== 1. 计算 Query Base Loss (含 Token-level) ==================
         with torch.no_grad():
             l_test_base_scalar, l_test_base_tokenwise_raw = compute_loss_per_sample(
-                self.model, query_batch, self.device, self.ignored_token_ids
+                self.model, query_batch, self.device
             )
             l_test_base = l_test_base_scalar.item()
 
@@ -190,11 +191,11 @@ class EmpiricalIF:
                 break
 
             # 使用加速后的梯度计算
-            grads = compute_gradients(self.model, query_batch, self.param_filter_fn, self.device, self.ignored_token_ids)
+            grads = compute_gradients(self.model, query_batch, self.param_filter_fn, self.device)
             self.apply_gradient_update(self.model, grads, self.param_filter_fn, lr=lr)
 
             with torch.no_grad():
-                loss_s, _ = compute_loss_per_sample(self.model, query_batch, self.device, self.ignored_token_ids)
+                loss_s, _ = compute_loss_per_sample(self.model, query_batch, self.device)
                 curr_test_loss = loss_s.item()
 
             if self.accelerator.is_main_process:
@@ -202,8 +203,7 @@ class EmpiricalIF:
 
         # ================== 4. 计算 Query Descent Loss (含 Token-level) ==================
         with torch.no_grad():
-            _, l_test_des_tokenwise_raw = compute_loss_per_sample(self.model, query_batch, self.device,
-                                                                  self.ignored_token_ids)
+            _, l_test_des_tokenwise_raw = compute_loss_per_sample(self.model, query_batch, self.device)
             l_test_des_tokenwise = l_test_des_tokenwise_raw[0][start_q:].cpu()
 
         query_token_diffs = l_test_des_tokenwise - l_test_base_tokenwise
@@ -247,6 +247,97 @@ class EmpiricalIF:
         return all_scores.tolist(), all_indices.tolist(), \
                global_train_diffs, query_token_diffs
 
+    def query_resonance_influence(self, query_batch: BatchDict, lr: float = 1e-2):
+        """
+        双向共振实现 (Polarized Version):
+        越正 -> 越 Helpful (因果同步下降)
+        越负 -> 越 Harmful (因果拮抗上升)
+        """
+        if self.base_train_results is None:
+            self.base_train_results = self._get_train_losses()
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        if self.accelerator.is_main_process:
+            logger.info("Computing Influence Function...")
+
+        self.model.eval()
+
+        # 1. 基准值计算
+        with torch.no_grad():
+            l_q_base_t, _ = compute_loss_per_sample(self.model, query_batch, self.device)
+            l_q_base = l_q_base_t.item()
+
+        # --- Stage A: Query 驱动 ---
+        grads_q = compute_gradients(self.model, query_batch, self.param_filter_fn, self.device)
+        self.apply_gradient_update(self.model, grads_q, self.param_filter_fn, lr=lr)
+
+        with torch.no_grad():
+            l_q_after_q, _ = compute_loss_per_sample(self.model, query_batch, self.device)
+            delta_q_by_q = l_q_after_q.item() - l_q_base  # 通常为负 (自优化)
+
+        l_train_at_q_sum, indices_local, _ = self._get_train_losses()
+        l_train_base_sum, _, _ = self.base_train_results
+        delta_train_by_q = (l_train_at_q_sum - l_train_base_sum).cpu()
+
+        # In-place reversal of query update
+        self.apply_gradient_update(self.model, grads_q, self.param_filter_fn, lr=-lr)
+        del grads_q  # Free gradient memory immediately
+        self.model.zero_grad(set_to_none=True)
+
+        # --- Stage B: Train 驱动 (样本级) ---
+        local_polarized_scores = []
+        idx_counter = 0
+
+        for batch in tqdm(self.train_batches, desc="Train -> Test"):
+            batch_size = batch['sample_index'].size(0)
+            for j in range(batch_size):
+                single_sample = {k: v[j:j + 1].to(self.device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
+                base_l_i = l_train_base_sum[idx_counter].item()
+
+                # 样本 i 更新
+                grads_i = compute_gradients(self.model, single_sample, self.param_filter_fn, self.device)
+                self.apply_gradient_update(self.model, grads_i, self.param_filter_fn, lr=lr)
+
+                with torch.no_grad():
+                    # 自身变化
+                    l_i_after_i, _ = compute_loss_per_sample(self.model, single_sample, self.device)
+                    delta_i_by_i = l_i_after_i.item() - base_l_i
+
+                    # 对 Query 的变化
+                    l_q_at_i, _ = compute_loss_per_sample(self.model, query_batch, self.device)
+                    delta_q_by_i = l_q_at_i.item() - l_q_base
+
+                # 1. 计算两项效能 (注意：delta_i_by_i 和 delta_q_by_q 永远是负的)
+                delta_i_by_q = delta_train_by_q[idx_counter].item()
+                eff_q_to_i = delta_i_by_q / (delta_i_by_i + 1e-8)
+                eff_i_to_q = delta_q_by_i / (delta_q_by_q + 1e-8)
+
+                # 符号判定：sign(ΔL_i|Q * ΔL_Q|i)
+                # 只有当两者同为负（Helpful共振）或同为正（Harmful共振）时，乘积为正
+                resonance_sign = 1.0 if delta_q_by_i < 0 else -1.0
+
+                # 计算最终 Score
+                magnitude   = torch.sqrt(torch.tensor(abs(eff_q_to_i * eff_i_to_q)))
+                final_score = resonance_sign * magnitude.item()
+
+                # 一致性门控：如果符号冲突（一个想帮，一个想害），权重降级
+                if (delta_i_by_q < 0) != (delta_q_by_i < 0):
+                    final_score = 0.0
+
+                local_polarized_scores.append(final_score)
+
+                # In-place reversal of i-update
+                self.apply_gradient_update(self.model, grads_i, self.param_filter_fn, lr=-lr)
+                del grads_i
+                self.model.zero_grad(set_to_none=True)
+                idx_counter += 1
+
+        # 全局汇总
+        all_scores  = self.accelerator.gather(torch.tensor(local_polarized_scores, device=self.device))
+        all_indices = self.accelerator.gather(indices_local)
+        return all_scores.tolist(), all_indices.tolist(), _, _
+
 
 def save_query_report_html(
         query_idx: int,
@@ -287,7 +378,7 @@ def save_query_report_html(
     snapshot = EmpiricalIF.get_param_snapshot(model, param_filter_fn)
     model.eval()
     for _ in range(max_steps):
-        grads = compute_gradients(model, query_batch, param_filter_fn, model.device, torch.tensor([], device=model.device))
+        grads = compute_gradients(model, query_batch, param_filter_fn, model.device)
         EmpiricalIF.apply_gradient_update(model, grads, param_filter_fn, lr=lr)
 
     logger.info(f"Generating 'After' responses for query {query_idx}...")
@@ -456,9 +547,9 @@ def main():
     torch.use_deterministic_algorithms(True)
 
     # 路径配置
-    JSONL_PATH = "/home/ruofan/git_space/Empirical-Influence-Function/sft.jsonl"  # 请确保文件存在
-    MODEL_ID   = "/home/ruofan/git_space/Empirical-Influence-Function/src/sft/scripts/checkpoint-full"
-    RESULTS_JSON_PATH = "/home/ruofan/git_space/Empirical-Influence-Function/experiment_results.jsonl"
+    JSONL_PATH = "/mnt/nvme0n1/ruofan/git_space/Empirical-Influence-Function/sft.jsonl"  # 请确保文件存在
+    MODEL_ID   = "/mnt/nvme0n1/ruofan/git_space/Empirical-Influence-Function/src/sft/scripts/checkpoint-full"
+    RESULTS_JSON_PATH = "/mnt/nvme0n1/ruofan/git_space/Empirical-Influence-Function/experiment_results.jsonl"
 
     accelerator = Accelerator()
     set_seed(42)
@@ -481,11 +572,11 @@ def main():
     tokenizer.padding_side = "right"
 
     # target_layer_keyword =
-    # model.lm_head.weight = nn.Parameter(model.model.embed_tokens.weight.detach().clone())
-    # model.config.tie_word_embeddings = False
+    model.lm_head.weight = nn.Parameter(model.model.embed_tokens.weight.detach().clone())
+    model.config.tie_word_embeddings = False
 
     # Freeze & Unfreeze
-    target_layer_keywords = ["model.layers.27", "embed_tokens"]
+    target_layer_keywords = ["lm_head"]
     for param in model.parameters():
         param.requires_grad = False
     for name, param in model.named_parameters():
@@ -552,7 +643,7 @@ def main():
     )
     collator = CustomCollator(base_collator)
 
-    BATCH_SIZE = 6
+    BATCH_SIZE = 2
     train_loader = DataLoader(
         train_ds,
         batch_size=BATCH_SIZE,
@@ -565,7 +656,6 @@ def main():
     total_samples = len(train_texts)
 
     eif = EmpiricalIF(train_loader, model, tokenizer, accelerator, filter_params,
-                      # debug_on=True)
                       debug_on=False)
 
     self_ranks = []
@@ -579,11 +669,6 @@ def main():
         # if i not in [7, 21, 32, 86, 37,
         #              38, 29, 42, 60]:
         #     continue
-
-        # if i not in [3 ,13, 16, 14, 28, 35, 24
-        # ]:
-        #     continue
-
         test_sample_dict = test_texts[i]
 
         # 临时处理 Query Batch
@@ -600,8 +685,12 @@ def main():
 
         # 运行 Influence Analysis
         # lr 可以适当大一点，因为我们只更新很少的步数
-        scores, indices, global_train_diffs, query_token_diffs = eif.query_influence(
-            query_batch, lr=5e-4, max_steps=10, loss_threshold=0.6
+        # scores, indices, global_train_diffs, query_token_diffs = eif.query_influence(
+        #     query_batch, lr=5e-4, max_steps=10, loss_threshold=0.6
+        # )
+
+        scores, indices, *_ = eif.query_resonance_influence(
+            query_batch, lr=5e-4
         )
 
         if accelerator.is_main_process:
