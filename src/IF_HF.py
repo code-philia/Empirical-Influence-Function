@@ -90,6 +90,8 @@ class EmpiricalIF:
             logger.info("Step 2: Pre-calculating Train Base Losses (Global Reference)...")
         # 这里计算的是该进程负责的那部分样本的 base loss
         self.base_train_results = self._get_train_losses()
+        gc.collect()
+        torch.cuda.empty_cache()
 
     @staticmethod
     def get_param_snapshot(model: nn.Module, param_filter_fn: Optional[ParamFilterFn]) -> List[torch.Tensor]:
@@ -247,117 +249,195 @@ class EmpiricalIF:
         return all_scores.tolist(), all_indices.tolist(), \
                global_train_diffs, query_token_diffs
 
-    def query_resonance_influence(self, query_batch: BatchDict, lr: float = 1e-2):
+    def query_resonance_influence(self, query_batch: Dict[str, torch.Tensor], lr: float = 1e-4, max_steps: int = 5):
         """
-        双向共振实现 (Polarized Version):
-        越正 -> 越 Helpful (因果同步下降)
-        越负 -> 越 Harmful (因果拮抗上升)
+        双向条件共振实现:
+        特意不恢复 Stage A 更新，以探测在 Q 背景下 i 的逻辑冲突。
         """
-        if self.base_train_results is None:
-            self.base_train_results = self._get_train_losses()
-            gc.collect()
-            torch.cuda.empty_cache()
+        # 0. 准备原始基准 (θ0)
+        l_train_base_vec, indices_local, _ = self.base_train_results
 
-        if self.accelerator.is_main_process:
-            logger.info("Computing Influence Function...")
-
-        self.model.eval()
-
-        # 1. 基准值计算
         with torch.no_grad():
             l_q_base_t, _ = compute_loss_per_sample(self.model, query_batch, self.device)
             l_q_base = l_q_base_t.item()
 
-        # --- Stage A: Query 驱动 ---
-        grads_q = compute_gradients(self.model, query_batch, self.param_filter_fn, self.device)
-        self.apply_gradient_update(self.model, grads_q, self.param_filter_fn, lr=lr)
+        # 备份原始参数 θ0
+        snapshot_theta0 = self.get_param_snapshot(self.model, self.param_filter_fn)
+
+        # --- Stage A: Query 驱动 (θ0 -> θQ) ---
+        for step in range(max_steps):
+            grads_q = compute_gradients(self.model, query_batch, self.param_filter_fn, self.device)
+            self.apply_gradient_update(self.model, grads_q, self.param_filter_fn, lr=lr)
+
+        # 记录 Q 更新后的基准
+        snapshot_after_q = self.get_param_snapshot(self.model, self.param_filter_fn)
 
         with torch.no_grad():
-            l_q_after_q, _ = compute_loss_per_sample(self.model, query_batch, self.device)
-            delta_q_by_q = l_q_after_q.item() - l_q_base  # 通常为负 (自优化)
+            # l_q_after_q: 学习 Q 后的 Q loss
+            l_q_after_q_t, _ = compute_loss_per_sample(self.model, query_batch, self.device)
+            l_q_after_q = l_q_after_q_t.item()
 
-        l_train_at_q_sum, indices_local, _ = self._get_train_losses()
-        l_train_base_sum, _, _ = self.base_train_results
-        delta_train_by_q = (l_train_at_q_sum - l_train_base_sum).cpu()
+            # l_train_at_q_vec: 学习 Q 后的所有训练样本 Loss (用于 Stage B 的起点)
+            l_train_at_q_vec, _, _ = self._get_train_losses()
 
-        # In-place reversal of query update
-        self.apply_gradient_update(self.model, grads_q, self.param_filter_fn, lr=-lr)
-        del grads_q  # Free gradient memory immediately
-        self.model.zero_grad(set_to_none=True)
+            # ΔL_i|q: Q 对 i 的原生拉动力 (相对于 θ0)
+            delta_train_by_q = (l_train_at_q_vec - l_train_base_vec).cpu()
+            # ΔL_q|q: Q 的自优化量
+            delta_q_by_q = l_q_after_q - l_q_base
 
-        # --- Stage B: Train 驱动 (样本级) ---
+        # --- Stage B: 条件探测 (θQ -> θQ+i) ---
         local_polarized_scores = []
         idx_counter = 0
 
-        for batch in tqdm(self.train_batches, desc="Train -> Test"):
+        for batch in tqdm(self.train_batches, desc="Conditioned Resonance Probing"):
             batch_size = batch['sample_index'].size(0)
             for j in range(batch_size):
                 single_sample = {k: v[j:j + 1].to(self.device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
-                base_l_i = l_train_base_sum[idx_counter].item()
 
-                # 样本 i 更新
-                grads_i = compute_gradients(self.model, single_sample, self.param_filter_fn, self.device)
-                self.apply_gradient_update(self.model, grads_i, self.param_filter_fn, lr=lr)
+                # 当前起点：已经学过 Q 后的样本 i 的 Loss
+                current_l_i_start = l_train_at_q_vec[idx_counter].item()
+
+                # 模拟学习样本 i (Stage B 建议 1-2 步)
+                for _ in range(1):
+                    grads_i = compute_gradients(self.model, single_sample, self.param_filter_fn, self.device)
+                    self.apply_gradient_update(self.model, grads_i, self.param_filter_fn, lr=lr)
 
                 with torch.no_grad():
-                    # 自身变化
+                    # 1. 条件自优化: ΔL_i|(i,q)
                     l_i_after_i, _ = compute_loss_per_sample(self.model, single_sample, self.device)
-                    delta_i_by_i = l_i_after_i.item() - base_l_i
+                    delta_i_conditioned = l_i_after_i.item() - current_l_i_start
 
-                    # 对 Query 的变化
-                    l_q_at_i, _ = compute_loss_per_sample(self.model, query_batch, self.device)
-                    delta_q_by_i = l_q_at_i.item() - l_q_base
+                    # 2. 条件对 Q 影响: ΔL_q|(i,q)
+                    l_q_at_i_t, _ = compute_loss_per_sample(self.model, query_batch, self.device)
+                    delta_q_conditioned = l_q_at_i_t.item() - l_q_after_q
 
-                # 1. 计算两项效能 (注意：delta_i_by_i 和 delta_q_by_q 永远是负的)
+                # --- 效能计算 ---
                 delta_i_by_q = delta_train_by_q[idx_counter].item()
-                eff_q_to_i = delta_i_by_q / (delta_i_by_i + 1e-8)
-                eff_i_to_q = delta_q_by_i / (delta_q_by_q + 1e-8)
 
-                # 符号判定：sign(ΔL_i|Q * ΔL_Q|i)
-                # 只有当两者同为负（Helpful共振）或同为正（Harmful共振）时，乘积为正
-                resonance_sign = 1.0 if delta_q_by_i < 0 else -1.0
+                # 归一化：帮了对方多少 / 自己能跑多远
+                eff_q_to_i = delta_i_by_q / (abs(delta_i_conditioned) + 1e-8)
+                eff_i_to_q = delta_q_conditioned / (abs(delta_q_by_q) + 1e-8)
 
-                # 计算最终 Score
-                magnitude   = torch.sqrt(torch.tensor(abs(eff_q_to_i * eff_i_to_q)))
+                # 判定：如果 delta_q_conditioned > 0，说明 i 导致 Q 的 Loss 反弹，即 Harmful
+                resonance_sign = 1.0 if delta_q_conditioned < 0 else -1.0
+
+                magnitude = torch.sqrt(torch.tensor(abs(eff_q_to_i * eff_i_to_q)))
                 final_score = resonance_sign * magnitude.item()
 
-                # 一致性门控：如果符号冲突（一个想帮，一个想害），权重降级
-                if (delta_i_by_q < 0) != (delta_q_by_i < 0):
+                # 一致性门控：若 Q 帮 i 的方向与 i 帮 Q 的方向相反（一个降一个升），判定为噪声
+                if (delta_i_by_q < 0) != (delta_q_conditioned < 0):
                     final_score = 0.0
 
                 local_polarized_scores.append(final_score)
 
-                # In-place reversal of i-update
-                self.apply_gradient_update(self.model, grads_i, self.param_filter_fn, lr=-lr)
-                del grads_i
+                # 恢复到 Stage A 的终点 (θQ)
+                self.restore_params(self.model, snapshot_after_q, self.param_filter_fn)
                 self.model.zero_grad(set_to_none=True)
                 idx_counter += 1
 
-        # 全局汇总
-        all_scores  = self.accelerator.gather(torch.tensor(local_polarized_scores, device=self.device))
-        all_indices = self.accelerator.gather(indices_local)
-        return all_scores.tolist(), all_indices.tolist(), _, _
+        # 恢复原始参数 θ0 (不影响后续其他 Query 的探测)
+        self.restore_params(self.model, snapshot_theta0, self.param_filter_fn)
 
+        # 全局通信汇总 (修正索引对齐问题)
+        all_scores = self.accelerator.gather(torch.tensor(local_polarized_scores, device=self.device))
+        all_indices = self.accelerator.gather(indices_local)
+
+        return all_scores.tolist(), all_indices.tolist(), None, None
+
+
+# --- 内部辅助函数：根据 input_ids 和 diffs 生成着色 HTML ---
+def get_colored_html_from_ids(
+        tokenizer: AutoTokenizer,
+        input_ids: torch.Tensor,
+        diffs_tensor: Optional[torch.Tensor] = None,
+        enable_coloring: bool=False
+):
+
+    # 1. Logic Check: If coloring is disabled or diffs are missing, return plain text
+    if not enable_coloring or diffs_tensor is None:
+        full_text = tokenizer.decode(input_ids, skip_special_tokens=False)
+        # Find the assistant response part to keep the report focused
+        try:
+            response_part = full_text.split("assistant\n")[-1]
+            return response_part.replace('\n', '<br>').replace(' ', '&nbsp;')
+        except:
+            return full_text.replace('\n', '<br>')
+
+    html_content = ""
+    threshold = 1e-4
+    diffs_list = diffs_tensor.tolist() if diffs_tensor is not None else []
+
+    tokens = tokenizer.convert_ids_to_tokens(input_ids, skip_special_tokens=False)
+    start_token_id     = tokenizer.convert_tokens_to_ids("<|im_start|>")
+    assistant_token_id = tokenizer.convert_tokens_to_ids("assistant")
+
+    # Default to starting from the beginning if not found (fallback)
+    output_start_idx = 0
+    input_ids_cpu = input_ids.cpu()
+
+    for i in range(len(input_ids_cpu) - 1):
+        if input_ids_cpu[i] == start_token_id and input_ids_cpu[i + 1] == assistant_token_id:
+            # Found <|im_start|>assistant. The content starts 2 tokens later.
+            output_start_idx = i + 2
+
+            if output_start_idx < len(input_ids_cpu):
+                next_token_id = input_ids_cpu[output_start_idx].item()
+                decoded_next = tokenizer.decode(next_token_id)
+                if decoded_next in ['\n', 'Ċ', 'Ġ\n']: # Check if it's a newline character (common in Qwen tokenizer)
+                    output_start_idx += 1
+            break
+
+    # [Modification]: Start iterating directly from output_start_idx
+    diff_idx = 0
+    for i in range(output_start_idx, len(tokens)):
+        t = tokens[i]
+        if t in [tokenizer.pad_token, tokenizer.eos_token, '<|im_end|>']:
+            break  # Stop coloring upon reaching end token
+
+        # Replace Qwen's special whitespace/newline tokens
+        display_t = t.replace('Ċ', '\n').replace('Ġ', ' ').replace('Ä‰', '\t')
+        display_t = display_t.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+        display_t = display_t.replace('\n', '<br>').replace('\t', '&nbsp;&nbsp;&nbsp;&nbsp;').replace(' ', '&nbsp;')
+
+        # Core Visualization Logic
+        if diff_idx < len(diffs_list):
+            d = diffs_list[diff_idx]
+            if d > threshold:
+                # Red highlight: Loss Increased
+                html_content += f'<span style="background-color: #ffebee; color: #c62828; font-weight: bold; border-radius: 2px; border-bottom: 1px solid #ffcdd2;">{display_t}</span>'
+            elif d < -threshold:
+                # Blue highlight: Loss Decreased
+                html_content += f'<span style="background-color: #e3f2fd; color: #1565c0; font-weight: bold; border-radius: 2px; border-bottom: 1px solid #bbdefb;">{display_t}</span>'
+            else:
+                html_content += display_t
+            diff_idx += 1
+        else:
+            # This branch should theoretically not be reached if diffs are aligned with Output
+            html_content += display_t
+
+    return html_content
 
 def save_query_report_html(
         query_idx: int,
-        query_batch: BatchDict,  # 新增：直接传入 Query 的 batch 数据
-        train_dataset: Dataset,  # 新增：传入整个训练数据集
+        query_batch: BatchDict,
+        train_dataset: Dataset,
         rank_pos: int,
         percentile: float,
         score: float,
         tokenizer: AutoTokenizer,
-        train_token_diffs_dict: Dict[int, torch.Tensor],
-        query_token_diffs: torch.Tensor,
-        top_5_harmful_indices: List[int],  # 新增：Top 5 有害样本的索引列表
-        top_5_harmful_scores: List[float],  # 新增：Top 5 有害样本的分数列表
-        top_5_helpful_indices: List[int],  #
-        top_5_helpful_scores: List[float],  #
+        # Now handles None safely
+        train_token_diffs_dict: Optional[Dict[int, torch.Tensor]],
+        query_token_diffs: Optional[torch.Tensor],
+        top_5_harmful_indices: List[int],
+        top_5_harmful_scores: List[float],
+        top_5_helpful_indices: List[int],
+        top_5_helpful_scores: List[float],
         model: nn.Module,
         param_filter_fn,
         lr,
         max_steps,
         output_dir: str = "reports",
+        enable_coloring: bool = True  # New Option: Toggle coloring on/off
 ):
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
@@ -385,70 +465,18 @@ def save_query_report_html(
     after_gens = get_gen_results(all_indices)
     EmpiricalIF.restore_params(model, snapshot, param_filter_fn)
 
-    # --- 内部辅助函数：根据 input_ids 和 diffs 生成着色 HTML ---
-    def get_colored_html_from_ids(input_ids: torch.Tensor, diffs_tensor: Optional[torch.Tensor] = None):
-        tokens = tokenizer.convert_ids_to_tokens(input_ids, skip_special_tokens=False)
-
-        html_content = ""
-        threshold = 1e-4
-        diffs_list = diffs_tensor.tolist() if diffs_tensor is not None else []
-
-        start_token_id     = tokenizer.convert_tokens_to_ids("<|im_start|>")
-        assistant_token_id = tokenizer.convert_tokens_to_ids("assistant")
-
-        # Default to starting from the beginning if not found (fallback)
-        output_start_idx = 0
-        input_ids_cpu = input_ids.cpu()
-
-        for i in range(len(input_ids_cpu) - 1):
-            if input_ids_cpu[i] == start_token_id and input_ids_cpu[i + 1] == assistant_token_id:
-                # Found <|im_start|>assistant. The content starts 2 tokens later.
-                output_start_idx = i + 2
-
-                if output_start_idx < len(input_ids_cpu):
-                    next_token_id = input_ids_cpu[output_start_idx].item()
-                    decoded_next = tokenizer.decode(next_token_id)
-                    if decoded_next in ['\n', 'Ċ', 'Ġ\n']: # Check if it's a newline character (common in Qwen tokenizer)
-                        output_start_idx += 1
-                break
-
-        # [Modification]: Start iterating directly from output_start_idx
-        diff_idx = 0
-        for i in range(output_start_idx, len(tokens)):
-            t = tokens[i]
-            if t in [tokenizer.pad_token, tokenizer.eos_token, '<|im_end|>']:
-                break  # Stop coloring upon reaching end token
-
-            # Replace Qwen's special whitespace/newline tokens
-            display_t = t.replace('Ċ', '\n').replace('Ġ', ' ').replace('Ä‰', '\t')
-            display_t = display_t.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-            display_t = display_t.replace('\n', '<br>').replace('\t', '&nbsp;&nbsp;&nbsp;&nbsp;').replace(' ', '&nbsp;')
-
-            # Core Visualization Logic
-            if diff_idx < len(diffs_list):
-                d = diffs_list[diff_idx]
-                if d > threshold:
-                    # Red highlight: Loss Increased
-                    html_content += f'<span style="background-color: #ffebee; color: #c62828; font-weight: bold; border-radius: 2px; border-bottom: 1px solid #ffcdd2;">{display_t}</span>'
-                elif d < -threshold:
-                    # Blue highlight: Loss Decreased
-                    html_content += f'<span style="background-color: #e3f2fd; color: #1565c0; font-weight: bold; border-radius: 2px; border-bottom: 1px solid #bbdefb;">{display_t}</span>'
-                else:
-                    html_content += display_t
-                diff_idx += 1
-            else:
-                # This branch should theoretically not be reached if diffs are aligned with Output
-                html_content += display_t
-
-        return html_content
-
     # 渲染 Top 样本的辅助逻辑
     def render_samples(indices, scores, title):
         nonlocal html_template
         html_template += f"<h2>{title}</h2>"
         for i, (idx, h_score) in enumerate(zip(indices, scores)):
             sample_data  = train_dataset[idx]
-            colored_code = get_colored_html_from_ids(sample_data["input_ids"].cpu(), train_token_diffs_dict.get(idx))
+            colored_code = get_colored_html_from_ids(
+                tokenizer=tokenizer,
+                input_ids=sample_data["input_ids"].cpu(),
+                diffs_tensor=train_token_diffs_dict.get(idx, None) if train_token_diffs_dict else None,
+                enable_coloring=enable_coloring
+            )
 
             # 直接从传入的字典获取生成结果
             base_gen = before_gens.get(idx, "No generation found")
@@ -484,7 +512,12 @@ def save_query_report_html(
     except:
         query_input_text = "Error extracting input text."
 
-    query_colored_code = get_colored_html_from_ids(query_input_ids, query_token_diffs)
+    query_colored_code = get_colored_html_from_ids(
+        tokenizer=tokenizer,
+        input_ids=query_input_ids,
+        diffs_tensor=query_token_diffs,
+        enable_coloring=enable_coloring
+    )
 
     # ... (HTML 头部样式保持不变) ...
     html_template = f"""
@@ -659,16 +692,15 @@ def main():
                       debug_on=False)
 
     self_ranks = []
-    if accelerator.is_main_process:
-        if os.path.exists(RESULTS_JSON_PATH):
-            shutil.move(RESULTS_JSON_PATH, f"{RESULTS_JSON_PATH}.bak")
-        logger.info(f"Results will be streamed to {RESULTS_JSON_PATH}")
+    # if accelerator.is_main_process:
+    #     if os.path.exists(RESULTS_JSON_PATH):
+    #         shutil.move(RESULTS_JSON_PATH, f"{RESULTS_JSON_PATH}.bak")
+    #     logger.info(f"Results will be streamed to {RESULTS_JSON_PATH}")
 
     for i in tqdm(range(len(test_texts)), desc="Running Experiments"):
 
-        # if i not in [7, 21, 32, 86, 37,
-        #              38, 29, 42, 60]:
-        #     continue
+        if i not in [89, 60, 98, 32, 67, 37, 86]:
+            continue
         test_sample_dict = test_texts[i]
 
         # 临时处理 Query Batch
@@ -683,6 +715,9 @@ def main():
         for k, v in query_batch.items():
             query_batch[k] = v.to(accelerator.device)
 
+        global_train_diffs = None
+        query_token_diffs = None
+
         # 运行 Influence Analysis
         # lr 可以适当大一点，因为我们只更新很少的步数
         # scores, indices, global_train_diffs, query_token_diffs = eif.query_influence(
@@ -690,7 +725,7 @@ def main():
         # )
 
         scores, indices, *_ = eif.query_resonance_influence(
-            query_batch, lr=5e-4
+            query_batch, lr=5e-4, max_steps=5,
         )
 
         if accelerator.is_main_process:
@@ -720,58 +755,58 @@ def main():
                 "percentile": percentile,
                 "score": float(self_score)  # 确保转为 float 以便 JSON 序列化
             }
-            with open(RESULTS_JSON_PATH, "a", encoding="utf-8") as f:
-                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            # with open(RESULTS_JSON_PATH, "a", encoding="utf-8") as f:
+            #     f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
-            # # # 准备 Top 5 Harmful 数据
-            # top_5_harmful = sorted_results[-5:][::-1]
-            # top_5_indices = [idx for idx, score in top_5_harmful]
-            # top_5_scores = [score for idx, score in top_5_harmful]
-            # # 准备 Top 5 Helpful 数据
-            # top_5_helpful = sorted_results[:5]
-            # top_5_helpful_indices = [idx for idx, score in top_5_helpful]
-            # top_5_helpful_scores = [score for idx, score in top_5_helpful]
-            #
-            # # 保存 HTML 报告
-            # save_query_report_html(
-            #     query_idx=i,
-            #     query_batch=query_batch,  # 传入 Query Batch
-            #     train_dataset=train_ds,  # 传入训练集 Dataset
-            #     rank_pos=rank_pos,
-            #     percentile=percentile,
-            #     score=self_score,
-            #     tokenizer=tokenizer,
-            #     train_token_diffs_dict=global_train_diffs,
-            #     query_token_diffs=query_token_diffs,
-            #     top_5_harmful_indices=top_5_indices,  # Top 5 索引
-            #     top_5_harmful_scores=top_5_scores,  # Top 5 分数
-            #     top_5_helpful_indices=top_5_helpful_indices,  # Top 5 索引
-            #     top_5_helpful_scores=top_5_helpful_scores,  # Top 5 分数
-            #     output_dir="influence_reports",
-            #     # output_dir="influence_reports_good",
-            #     lr=1e-3,
-            #     max_steps=20,
-            #     model=model,
-            #     param_filter_fn=filter_params
-            # )
+            # # 准备 Top 5 Harmful 数据
+            top_5_harmful = sorted_results[-5:][::-1]
+            top_5_indices = [idx for idx, score in top_5_harmful]
+            top_5_scores = [score for idx, score in top_5_harmful]
+            # 准备 Top 5 Helpful 数据
+            top_5_helpful = sorted_results[:5]
+            top_5_helpful_indices = [idx for idx, score in top_5_helpful]
+            top_5_helpful_scores = [score for idx, score in top_5_helpful]
 
-            if i % 5 == 0:
-                # 转换为 numpy 数组方便计算
-                ranks_arr = np.array(self_ranks)
+            # 保存 HTML 报告
+            save_query_report_html(
+                query_idx=i,
+                query_batch=query_batch,  # 传入 Query Batch
+                train_dataset=train_ds,  # 传入训练集 Dataset
+                rank_pos=rank_pos,
+                percentile=percentile,
+                score=self_score,
+                tokenizer=tokenizer,
+                train_token_diffs_dict=global_train_diffs,
+                query_token_diffs=query_token_diffs,
+                top_5_harmful_indices=top_5_indices,  # Top 5 索引
+                top_5_harmful_scores=top_5_scores,  # Top 5 分数
+                top_5_helpful_indices=top_5_helpful_indices,  # Top 5 索引
+                top_5_helpful_scores=top_5_helpful_scores,  # Top 5 分数
+                output_dir="influence_reports",
+                # output_dir="influence_reports_good",
+                lr=5e-4,
+                max_steps=5,
+                model=model,
+                param_filter_fn=filter_params,
+                enable_coloring = False,
+            )
 
-                # 计算统计量
-                min_rank = np.min(ranks_arr)
-                max_rank = np.max(ranks_arr)
-                median_rank = np.median(ranks_arr)
+            # 转换为 numpy 数组方便计算
+            ranks_arr = np.array(self_ranks)
 
-                print("\n" + "=" * 60)
-                print("🧪 EXPERIMENT REPORT: Mismatched Query (Self-Input + Other-Output)")
-                print(f"Target Layer         : {target_layer_keywords}")
-                print(f"Total Samples Tested : {len(self_ranks)}")
-                print("-" * 60)
-                print(f"📉 Min Rank          : {min_rank:.0f}")
-                print(f"📈 Max Rank          : {max_rank:.0f}")
-                print(f"⚖️  Median Rank      : {median_rank:.1f}")
+            # 计算统计量
+            min_rank = np.min(ranks_arr)
+            max_rank = np.max(ranks_arr)
+            median_rank = np.median(ranks_arr)
+
+            print("\n" + "=" * 60)
+            print("🧪 EXPERIMENT REPORT: Mismatched Query (Self-Input + Other-Output)")
+            print(f"Target Layer         : {target_layer_keywords}")
+            print(f"Total Samples Tested : {len(self_ranks)}")
+            print("-" * 60)
+            print(f"📉 Min Rank          : {min_rank:.0f}")
+            print(f"📈 Max Rank          : {max_rank:.0f}")
+            print(f"⚖️  Median Rank      : {median_rank:.1f}")
 
 
     if accelerator.is_main_process:
