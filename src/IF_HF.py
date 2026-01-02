@@ -99,7 +99,7 @@ class EmpiricalIF:
         for name, param in model.named_parameters():
             if param.requires_grad:
                 if param_filter_fn is None or param_filter_fn(name, param):
-                    snapshot.append(param.detach().clone())
+                    snapshot.append(param.detach().cpu().clone())
         return snapshot
 
     @staticmethod
@@ -108,7 +108,7 @@ class EmpiricalIF:
         for name, param in model.named_parameters():
             if param.requires_grad:
                 if param_filter_fn is None or param_filter_fn(name, param):
-                    param.data.copy_(snapshot[idx])
+                    param.data.copy_(snapshot[idx].to(param.device))
                     idx += 1
 
     @staticmethod
@@ -165,6 +165,7 @@ class EmpiricalIF:
             logger.info("Computing Influence Function...")
 
         self.model.eval()
+        self.model.zero_grad(set_to_none=True)
 
         # ================== 1. 计算 Query Base Loss (含 Token-level) ==================
         with torch.no_grad():
@@ -195,6 +196,7 @@ class EmpiricalIF:
             # 使用加速后的梯度计算
             grads = compute_gradients(self.model, query_batch, self.param_filter_fn, self.device)
             self.apply_gradient_update(self.model, grads, self.param_filter_fn, lr=lr)
+            self.model.zero_grad(set_to_none=True)
 
             with torch.no_grad():
                 loss_s, _ = compute_loss_per_sample(self.model, query_batch, self.device)
@@ -264,10 +266,12 @@ class EmpiricalIF:
         # 备份原始参数 θ0
         snapshot_theta0 = self.get_param_snapshot(self.model, self.param_filter_fn)
 
+        self.model.zero_grad(set_to_none=True)
         # --- Stage A: Query 驱动 (θ0 -> θQ) ---
         for step in range(max_steps):
             grads_q = compute_gradients(self.model, query_batch, self.param_filter_fn, self.device)
             self.apply_gradient_update(self.model, grads_q, self.param_filter_fn, lr=lr)
+            self.model.zero_grad(set_to_none=True)
 
         # 记录 Q 更新后的基准
         snapshot_after_q = self.get_param_snapshot(self.model, self.param_filter_fn)
@@ -300,7 +304,8 @@ class EmpiricalIF:
                 # 模拟学习样本 i (Stage B 建议 1-2 步)
                 for _ in range(1):
                     grads_i = compute_gradients(self.model, single_sample, self.param_filter_fn, self.device)
-                    self.apply_gradient_update(self.model, grads_i, self.param_filter_fn, lr=lr)
+                    self.apply_gradient_update(self.model, grads_i, self.param_filter_fn, lr=lr * 100) # fixme: larger training lr
+                    self.model.zero_grad(set_to_none=True)
 
                 with torch.no_grad():
                     # 1. 条件自优化: ΔL_i|(i,q)
@@ -457,9 +462,11 @@ def save_query_report_html(
     # 临时重演扰动
     snapshot = EmpiricalIF.get_param_snapshot(model, param_filter_fn)
     model.eval()
+    self.model.zero_grad(set_to_none=True)
     for _ in range(max_steps):
         grads = compute_gradients(model, query_batch, param_filter_fn, model.device)
         EmpiricalIF.apply_gradient_update(model, grads, param_filter_fn, lr=lr)
+        self.model.zero_grad(set_to_none=True)
 
     logger.info(f"Generating 'After' responses for query {query_idx}...")
     after_gens = get_gen_results(all_indices)
@@ -656,7 +663,7 @@ def main():
                 "output": train_texts[perturbed_idx]["output"],
             }
         )
-        if len(test_texts) >= 100:
+        if len(test_texts) >= 50:
             break
 
     # Dataset Preparation
@@ -692,15 +699,16 @@ def main():
                       debug_on=False)
 
     self_ranks = []
-    # if accelerator.is_main_process:
-    #     if os.path.exists(RESULTS_JSON_PATH):
-    #         shutil.move(RESULTS_JSON_PATH, f"{RESULTS_JSON_PATH}.bak")
-    #     logger.info(f"Results will be streamed to {RESULTS_JSON_PATH}")
+    self_scores = []
+    if accelerator.is_main_process:
+        if os.path.exists(RESULTS_JSON_PATH):
+            shutil.move(RESULTS_JSON_PATH, f"{RESULTS_JSON_PATH}.bak")
+        logger.info(f"Results will be streamed to {RESULTS_JSON_PATH}")
 
     for i in tqdm(range(len(test_texts)), desc="Running Experiments"):
 
-        if i not in [89, 60, 98, 32, 67, 37, 86]:
-            continue
+        # if i not in [89, 60, 98, 32, 67, 37, 86]:
+        #     continue
         test_sample_dict = test_texts[i]
 
         # 临时处理 Query Batch
@@ -747,6 +755,7 @@ def main():
                 # if idx == 0:
 
             self_ranks.append(rank_pos + 1)
+            self_scores.append(self_score)
             percentile = (rank_pos + 1) / total_samples
             entry = {
                 "query_index": i,
@@ -755,41 +764,41 @@ def main():
                 "percentile": percentile,
                 "score": float(self_score)  # 确保转为 float 以便 JSON 序列化
             }
-            # with open(RESULTS_JSON_PATH, "a", encoding="utf-8") as f:
-            #     f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            with open(RESULTS_JSON_PATH, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
-            # # 准备 Top 5 Harmful 数据
-            top_5_harmful = sorted_results[-5:][::-1]
-            top_5_indices = [idx for idx, score in top_5_harmful]
-            top_5_scores = [score for idx, score in top_5_harmful]
-            # 准备 Top 5 Helpful 数据
-            top_5_helpful = sorted_results[:5]
-            top_5_helpful_indices = [idx for idx, score in top_5_helpful]
-            top_5_helpful_scores = [score for idx, score in top_5_helpful]
-
-            # 保存 HTML 报告
-            save_query_report_html(
-                query_idx=i,
-                query_batch=query_batch,  # 传入 Query Batch
-                train_dataset=train_ds,  # 传入训练集 Dataset
-                rank_pos=rank_pos,
-                percentile=percentile,
-                score=self_score,
-                tokenizer=tokenizer,
-                train_token_diffs_dict=global_train_diffs,
-                query_token_diffs=query_token_diffs,
-                top_5_harmful_indices=top_5_indices,  # Top 5 索引
-                top_5_harmful_scores=top_5_scores,  # Top 5 分数
-                top_5_helpful_indices=top_5_helpful_indices,  # Top 5 索引
-                top_5_helpful_scores=top_5_helpful_scores,  # Top 5 分数
-                output_dir="influence_reports",
-                # output_dir="influence_reports_good",
-                lr=5e-4,
-                max_steps=5,
-                model=model,
-                param_filter_fn=filter_params,
-                enable_coloring = False,
-            )
+            # # # 准备 Top 5 Harmful 数据
+            # top_5_harmful = sorted_results[-5:][::-1]
+            # top_5_indices = [idx for idx, score in top_5_harmful]
+            # top_5_scores = [score for idx, score in top_5_harmful]
+            # # 准备 Top 5 Helpful 数据
+            # top_5_helpful = sorted_results[:5]
+            # top_5_helpful_indices = [idx for idx, score in top_5_helpful]
+            # top_5_helpful_scores = [score for idx, score in top_5_helpful]
+            #
+            # # 保存 HTML 报告
+            # save_query_report_html(
+            #     query_idx=i,
+            #     query_batch=query_batch,  # 传入 Query Batch
+            #     train_dataset=train_ds,  # 传入训练集 Dataset
+            #     rank_pos=rank_pos,
+            #     percentile=percentile,
+            #     score=self_score,
+            #     tokenizer=tokenizer,
+            #     train_token_diffs_dict=global_train_diffs,
+            #     query_token_diffs=query_token_diffs,
+            #     top_5_harmful_indices=top_5_indices,  # Top 5 索引
+            #     top_5_harmful_scores=top_5_scores,  # Top 5 分数
+            #     top_5_helpful_indices=top_5_helpful_indices,  # Top 5 索引
+            #     top_5_helpful_scores=top_5_helpful_scores,  # Top 5 分数
+            #     output_dir="influence_reports",
+            #     # output_dir="influence_reports_good",
+            #     lr=5e-4,
+            #     max_steps=5,
+            #     model=model,
+            #     param_filter_fn=filter_params,
+            #     enable_coloring = False,
+            # )
 
             # 转换为 numpy 数组方便计算
             ranks_arr = np.array(self_ranks)
@@ -798,6 +807,7 @@ def main():
             min_rank = np.min(ranks_arr)
             max_rank = np.max(ranks_arr)
             median_rank = np.median(ranks_arr)
+            median_score = np.median(np.array(self_scores))
 
             print("\n" + "=" * 60)
             print("🧪 EXPERIMENT REPORT: Mismatched Query (Self-Input + Other-Output)")
@@ -807,6 +817,7 @@ def main():
             print(f"📉 Min Rank          : {min_rank:.0f}")
             print(f"📈 Max Rank          : {max_rank:.0f}")
             print(f"⚖️  Median Rank      : {median_rank:.1f}")
+            print(f"Median score         : {median_score:.1f} ")
 
 
     if accelerator.is_main_process:
@@ -822,6 +833,7 @@ def main():
         min_rank    = np.min(ranks_arr)
         max_rank    = np.max(ranks_arr)
         median_rank = np.median(ranks_arr)
+        median_score = np.median(np.array(self_scores))
 
         print("\n" + "=" * 60)
         print("🧪 EXPERIMENT REPORT: Mismatched Query (Self-Input + Other-Output)")
@@ -831,7 +843,7 @@ def main():
         print(f"📉 Min Rank          : {min_rank:.0f}")
         print(f"📈 Max Rank          : {max_rank:.0f}")
         print(f"⚖️  Median Rank      : {median_rank:.1f}")
-
+        print(f"Median score         : {median_score:.1f} ")
 
 if __name__ == '__main__':
     main()
