@@ -34,9 +34,9 @@ export WANDB_PROJECT="EIF"
 # --- 显卡与并行设置 ---
 GPUS_PER_NODE=$(nvidia-smi --list-gpus | wc -l)
 WORLD_SIZE=$GPUS_PER_NODE # 假设单节点，多节点需调整
-BATCH_SIZE=128
-MICRO_BATCH_SIZE=4
-EPOCH=4
+BATCH_SIZE=16
+MICRO_BATCH_SIZE=1
+EPOCH=3
 GRAD_ACCU=$(($BATCH_SIZE / $WORLD_SIZE / $MICRO_BATCH_SIZE))
 
 # --- 执行 ---
@@ -52,7 +52,8 @@ http_proxy=127.0.0.1:7890 https_proxy=127.0.0.1:7890 torchrun \
     train.py \
     --model_name_or_path ${PRETRAINED_MODEL} \
     --data_path ${DATA_PATH} \
-    --model_max_length 1280 \
+    --model_max_length 4096 \
+    --truncate_source True \
     --output_dir ${OUTPUT_DIR} \
     --num_train_epochs ${EPOCH} \
     --per_device_train_batch_size ${MICRO_BATCH_SIZE} \
