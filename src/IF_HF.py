@@ -32,42 +32,9 @@ logger = logging.getLogger(__name__)
 # 类型别名
 ParamFilterFn = Callable[[str, nn.Parameter], bool]
 
-@torch.inference_mode()
-def generate_response(model, tokenizer, input_ids, device):
-    input_ids = input_ids.to(device)
-    # 找到 assistant 的起始位置，截取输入部分
-    start_token_id     = tokenizer.convert_tokens_to_ids("<|im_start|>")
-    assistant_token_id = tokenizer.convert_tokens_to_ids("assistant")
-
-    prompt_end_idx = len(input_ids)
-    for i in range(len(input_ids) - 1):
-        if input_ids[i] == start_token_id and input_ids[i + 1] == assistant_token_id:
-            # 输入应包含到 <|im_start|>assistant\n 为止
-            prompt_end_idx = i + 2
-            # 尝试跳过换行
-            if prompt_end_idx < len(input_ids):
-                next_id = input_ids[prompt_end_idx].item()
-                if tokenizer.decode(next_id) in ['\n', 'Ċ', 'Ġ\n']:
-                    prompt_end_idx += 1
-            break
-
-    prompt_ids = input_ids[:prompt_end_idx].unsqueeze(0).to(device)  # 增加 batch 维度
-
-    with torch.no_grad():
-        generated_ids = model.generate(
-            prompt_ids,
-            max_new_tokens=20,  # 可根据需要调整
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.convert_tokens_to_ids("<|im_end|>")
-        )
-
-    # 只解码新生成的 token
-    new_tokens = generated_ids[0][prompt_end_idx:]
-    generated_text = tokenizer.decode(new_tokens, skip_special_tokens=True)
-    return generated_text
-
 
 class EmpiricalIF:
+
     def __init__(self, dl_train, model, tokenizer, accelerator, param_filter_fn=None, debug_on=False):
         self.dl_train = dl_train
         self.model = model
@@ -75,7 +42,8 @@ class EmpiricalIF:
         self.accelerator = accelerator
         self.device = accelerator.device
         self.param_filter_fn = param_filter_fn
-        self.ignored_token_ids = torch.tensor([], device=self.device)
+        ids_list = tokenizer.convert_tokens_to_ids(['Ċ', 'Ġ', 'Ä'])  # 这里填入你想忽略的 token 字符串
+        self.ignored_token_ids = torch.tensor(ids_list, device=self.device)
         self.debug_on = debug_on
 
         # 1. 缓存训练数据至 CPU，防止显存占用过多
@@ -137,7 +105,7 @@ class EmpiricalIF:
         with torch.no_grad():
             for batch in self.train_batches:
                 batch_gpu = {k: v.to(self.device) for k, v in batch.items()}
-                mean_loss, token_loss = compute_loss_per_sample(self.model, batch_gpu, self.device)
+                mean_loss, token_loss = compute_loss_per_sample(self.model, batch_gpu, self.device, self.ignored_token_ids)
 
                 shift_labels = batch_gpu["labels"][..., 1:].contiguous()
                 indices = batch_gpu["sample_index"].cpu().tolist()
@@ -172,7 +140,7 @@ class EmpiricalIF:
         # ================== 1. 计算 Query Base Loss (含 Token-level) ==================
         with torch.no_grad():
             l_test_base_scalar, l_test_base_tokenwise_raw = compute_loss_per_sample(
-                self.model, query_batch, self.device
+                self.model, query_batch, self.device, self.ignored_token_ids
             )
             l_test_base = l_test_base_scalar.item()
 
@@ -196,12 +164,12 @@ class EmpiricalIF:
                 break
 
             # 使用加速后的梯度计算
-            grads = compute_gradients(self.model, query_batch, self.param_filter_fn, self.device)
+            grads = compute_gradients(self.model, query_batch, self.param_filter_fn, self.device, self.ignored_token_ids)
             self.apply_gradient_update(self.model, grads, self.param_filter_fn, lr=lr)
             self.model.zero_grad(set_to_none=True)
 
             with torch.no_grad():
-                loss_s, _ = compute_loss_per_sample(self.model, query_batch, self.device)
+                loss_s, _ = compute_loss_per_sample(self.model, query_batch, self.device, self.ignored_token_ids)
                 curr_test_loss = loss_s.item()
 
             if self.accelerator.is_main_process:
@@ -209,7 +177,7 @@ class EmpiricalIF:
 
         # ================== 4. 计算 Query Descent Loss (含 Token-level) ==================
         with torch.no_grad():
-            _, l_test_des_tokenwise_raw = compute_loss_per_sample(self.model, query_batch, self.device)
+            _, l_test_des_tokenwise_raw = compute_loss_per_sample(self.model, query_batch, self.device, self.ignored_token_ids)
             l_test_des_tokenwise = l_test_des_tokenwise_raw[0][start_q:].cpu()
 
         query_token_diffs = l_test_des_tokenwise - l_test_base_tokenwise
@@ -270,13 +238,13 @@ class EmpiricalIF:
         l_train_theta0, indices_local, _ = self.base_train_results
 
         with torch.no_grad():
-            l_query_theta0, _ = compute_loss_per_sample(self.model, query_batch, self.device)
+            l_query_theta0, _ = compute_loss_per_sample(self.model, query_batch, self.device, self.ignored_token_ids)
             l_query_theta0 = l_query_theta0.item()
 
         # --- Stage A: Query 驱动 (θ0 -> θQ) ---
         self.model.zero_grad(set_to_none=True)
         for step in range(max_steps):
-            grads_q = compute_gradients(self.model, query_batch, self.param_filter_fn, self.device)
+            grads_q = compute_gradients(self.model, query_batch, self.param_filter_fn, self.device, self.ignored_token_ids)
             self.apply_gradient_update(self.model, grads_q, self.param_filter_fn, lr=lr)
             self.model.zero_grad(set_to_none=True)
 
@@ -285,7 +253,7 @@ class EmpiricalIF:
 
         with torch.no_grad():
             # 学习 Q 后的 Q loss
-            l_query_thetaQ, _ = compute_loss_per_sample(self.model, query_batch, self.device)
+            l_query_thetaQ, _ = compute_loss_per_sample(self.model, query_batch, self.device, self.ignored_token_ids)
             l_query_thetaQ = l_query_thetaQ.item()
 
             # 学习 Q 后的所有训练样本 Loss (用于 Stage B 的起点)
@@ -311,17 +279,17 @@ class EmpiricalIF:
                 # 模拟学习样本 i fixme: I only update for 1 step, but timed learning rate by max_steps
                 self.model.zero_grad(set_to_none=True)
                 for step in range(1):
-                    grads_i = compute_gradients(self.model, single_sample, self.param_filter_fn, self.device)
+                    grads_i = compute_gradients(self.model, single_sample, self.param_filter_fn, self.device, self.ignored_token_ids)
                     self.apply_gradient_update(self.model, grads_i, self.param_filter_fn, lr=lr * max_steps)
                     self.model.zero_grad(set_to_none=True)
 
                 with torch.no_grad():
                     # 1. 条件自优化: ΔL_i|(i,q)
-                    l_train_thetai, _ = compute_loss_per_sample(self.model, single_sample, self.device)
+                    l_train_thetai, _ = compute_loss_per_sample(self.model, single_sample, self.device, self.ignored_token_ids)
                     delta_i_by_i = l_train_thetai.item() - l_train_thetaQ_i
 
                     # 2. 条件对 Q 影响: ΔL_q|(i,q)
-                    l_query_thetai, _ = compute_loss_per_sample(self.model, query_batch, self.device)
+                    l_query_thetai, _ = compute_loss_per_sample(self.model, query_batch, self.device, self.ignored_token_ids)
                     delta_q_by_i = l_query_thetai.item() - l_query_thetaQ
 
                 # --- 效能计算 ---
@@ -347,14 +315,19 @@ class EmpiricalIF:
                 self.restore_params(self.model, snapshot_thetaQ, self.param_filter_fn)
                 idx_counter += 1
 
+            gc.collect()
+            torch.cuda.empty_cache()
+
         # 恢复原始参数 θ0 (不影响后续其他 Query 的探测)
         self.restore_params(self.model, snapshot_theta0, self.param_filter_fn)
+        gc.collect()
+        torch.cuda.empty_cache()
 
         # 全局通信汇总 (修正索引对齐问题)
         all_scores = self.accelerator.gather(torch.tensor(local_polarized_scores, device=self.device))
         all_indices = self.accelerator.gather(indices_local)
 
-        return all_scores.tolist(), all_indices.tolist(), None, None
+        return all_scores.cpu().tolist(), all_indices.cpu().tolist(), None, None
 
 
 # --- 内部辅助函数：根据 input_ids 和 diffs 生成着色 HTML ---
@@ -379,7 +352,6 @@ def get_colored_html_from_ids(
     diffs_list = diffs_tensor.tolist() if diffs_tensor is not None else []
 
     tokens = tokenizer.convert_ids_to_tokens(input_ids, skip_special_tokens=False)
-    start_token_id     = tokenizer.convert_tokens_to_ids("<|im_start|>")
     assistant_token_id = tokenizer.convert_tokens_to_ids("assistant")
 
     # 找到 Output 开始的位置
@@ -387,8 +359,8 @@ def get_colored_html_from_ids(
     input_ids_cpu = input_ids.cpu()
 
     for i in range(len(input_ids_cpu) - 1):
-        if input_ids_cpu[i] == start_token_id and input_ids_cpu[i + 1] == assistant_token_id:
-            output_start_idx = i + 2
+        if input_ids_cpu[i] == assistant_token_id:
+            output_start_idx = i + 1
             if output_start_idx < len(input_ids_cpu):
                 next_token_id = input_ids_cpu[output_start_idx].item()
                 decoded_next = tokenizer.decode(next_token_id)
@@ -430,14 +402,6 @@ def get_colored_html_from_ids(
     return html_content
 
 
-def get_gen_results(train_dataset, indices, model, tokenizer,):
-    results = {}
-    model.eval()
-    for idx in indices:
-        sample = train_dataset[idx]
-        results[idx] = generate_response(model, tokenizer, sample["input_ids"], model.device)
-    return results
-
 def save_query_report_html(
         query_idx: int,
         query_batch: BatchDict,
@@ -463,68 +427,101 @@ def save_query_report_html(
     # 对应的分数列表，用于展示
     all_scores = [score] + top_5_helpful_scores + top_5_harmful_scores
     train_raw_samples = [train_dataset[i] for i in all_indices]
-    train_batch = collator(train_raw_samples)
+    ids_list = tokenizer.convert_tokens_to_ids(['Ċ','Ġ', 'Ä'])  # 这里填入你想忽略的 token 字符串
+    ignored_token_ids = torch.tensor(ids_list, device=self.device)
 
-    # 确保 Batch 在设备上
-    for k, v in train_batch.items():
-        if isinstance(v, torch.Tensor):
-            train_batch[k] = v.to(model.device)
+    def compute_loss_in_minibatches(samples_list, batch_size=2):
+        all_samples_loss_list = []  # 存储每个样本的 1D Tensor
+
+        # 手动分批
+        for i in range(0, len(samples_list), batch_size):
+            batch_samples = samples_list[i: i + batch_size]
+            batch = collator(batch_samples)
+
+            # 移到 GPU
+            batch = {k: v.to(model.device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
+
+            with torch.no_grad():
+                # token_loss shape: [Current_Batch_Size, Current_Seq_Len]
+                _, token_loss = compute_loss_per_sample(model, batch, model.device, ignored_token_ids)
+
+            # 立即上 CPU
+            token_loss_cpu = token_loss.detach().cpu()
+
+            # 【关键】把 Batch 拆开，按样本存入列表
+            all_samples_loss_list.extend(token_loss_cpu.unbind(0))
+            del batch
+
+        return all_samples_loss_list
 
     # 临时重演扰动
     snapshot_theta0 = EmpiricalIF.get_param_snapshot(model, param_filter_fn)
     with torch.no_grad():
-        _, l_train_token_loss_theta0 = compute_loss_per_sample(model, train_batch, model.device)
+        # 【修正】这里得到的是 List[Tensor]，列表长度 = 11 (样本数)
+        l_train_token_loss_theta0 = compute_loss_in_minibatches(train_raw_samples, batch_size=2)
 
     # 1. Query 驱动 (θ0 -> θQ) ---
     for step in range(max_steps):
         model.zero_grad(set_to_none=True)
-        grads_q = compute_gradients(model, query_batch, param_filter_fn, model.device)
+        grads_q = compute_gradients(model, query_batch, param_filter_fn, model.device, ignored_token_ids)
         EmpiricalIF.apply_gradient_update(model, grads_q, param_filter_fn, lr=lr)
+        del grads_q
 
     # 2. 计算 Theta Q 状态下的 Training Loss (Batch 推理)
     model.eval()
     with torch.no_grad():
-        _, l_train_token_loss_thetaQ = compute_loss_per_sample(model, train_batch, model.device)
-        _, l_query_token_loss_thetaQ = compute_loss_per_sample(model, query_batch, model.device)
+        l_train_token_loss_thetaQ = compute_loss_in_minibatches(train_raw_samples, batch_size=2)
+
+        _, l_query_token_loss_thetaQ = compute_loss_per_sample(model, query_batch, model.device, ignored_token_ids)
+        l_query_token_loss_thetaQ = l_query_token_loss_thetaQ.detach()  # 保持在 GPU 但切断梯度
 
     # 3. 计算 Delta train from theta0 to thetaQ
-    delta_train_token_loss_theta0_to_thetaQ = l_train_token_loss_thetaQ - l_train_token_loss_theta0
+    delta_train_token_loss_theta0_to_thetaQ = [
+        loss_q - loss_0
+        for loss_q, loss_0 in zip(l_train_token_loss_thetaQ, l_train_token_loss_theta0)
+    ]
 
     # 4. 计算 Delta query from thetaQ to thetai
     snapshot_thetaQ = EmpiricalIF.get_param_snapshot(model, param_filter_fn)
     delta_query_token_loss_thetaQ_to_thetai = []
 
-    batch_size = train_batch['input_ids'].size(0)
-
-    # 直接遍历每一个样本的索引 j
-    for j in tqdm(range(batch_size), desc="Conditioned Resonance Probing"):
-
-        # 切片获取单个样本，同时保持 batch 维度 (1, seq_len)
-        single_sample = {
-            k: v[j:j + 1].to(model.device)
-            for k, v in train_batch.items()
-            if isinstance(v, torch.Tensor)
-        }
-
-        # 模拟学习样本 i: fixme: I only update for 1 step
+    for j, raw_sample in tqdm(enumerate(train_raw_samples), total=len(train_raw_samples), desc="Report Probing"):
+        # 显式清理
         model.zero_grad(set_to_none=True)
-        for step in range(1):
-            grads_i = compute_gradients(model, single_sample, param_filter_fn, model.device)
-            EmpiricalIF.apply_gradient_update(model, grads_i, param_filter_fn, lr=lr * max_steps)
-            model.zero_grad(set_to_none=True)
+
+        # 构造单样本 Batch
+        single_batch = collator([raw_sample])
+        single_batch = {k: v.to(model.device) for k, v in single_batch.items() if isinstance(v, torch.Tensor)}
+
+        # 模拟学习
+        grads_i = compute_gradients(model, single_batch, param_filter_fn, model.device, ignored_token_ids)
+        EmpiricalIF.apply_gradient_update(model, grads_i, param_filter_fn, lr=lr * max_steps)
+        del grads_i  # 立即删梯度
 
         with torch.no_grad():
-            _, l_query_token_loss_thetai = compute_loss_per_sample(model, query_batch, model.device)
+            _, l_query_token_loss_thetai = compute_loss_per_sample(model, query_batch, model.device, ignored_token_ids)
 
         diff = l_query_token_loss_thetai[0] - l_query_token_loss_thetaQ[0]
-        delta_query_token_loss_thetaQ_to_thetai.append(diff.cpu())
+        delta_query_token_loss_thetaQ_to_thetai.append(diff.detach().cpu()) # 【关键】上 CPU
 
         # 恢复到 θQ
         EmpiricalIF.restore_params(model, snapshot_thetaQ, param_filter_fn)
+        # 7. 【关键】清理本轮产生的中间变量
+        del single_batch
+        del l_query_token_loss_thetai
+        del diff
+
+        # 8. 激进的显存清理 (每 N 轮清理一次，或者每轮清理防止 OOM)
+        if j % 1 == 0:
+            torch.cuda.empty_cache()
 
     delta_query_token_loss_thetaQ_to_thetai = torch.stack(delta_query_token_loss_thetaQ_to_thetai)
     EmpiricalIF.restore_params(model, snapshot_theta0, param_filter_fn) # restore to original
-
+    # 最后的清理
+    del snapshot_theta0
+    del snapshot_thetaQ
+    gc.collect()
+    torch.cuda.empty_cache()
     # ================= 2. 渲染 HTML 报告阶段 =================
 
     # 2.1 准备 Query 自身的静态信息
@@ -623,7 +620,11 @@ def save_query_report_html(
             type_label = f"Top Harmful #{j - 5}"
 
         # --- 准备 Train Sample 数据 ---
-        train_input_ids = train_batch["input_ids"][j].cpu()
+        raw_sample = train_raw_samples[j]
+        train_input_ids = raw_sample["input_ids"]  # 已经是 Tensor
+        if isinstance(train_input_ids, torch.Tensor):
+            train_input_ids = train_input_ids.cpu()
+
         train_full_text = tokenizer.decode(train_input_ids, skip_special_tokens=True)
         try:
             train_input_str = train_full_text.split("assistant\n")[0].strip()
@@ -688,7 +689,7 @@ def main():
     torch.use_deterministic_algorithms(True)
 
     # 路径配置
-    JSONL_PATH = "/mnt/nvme0n1/ruofan/git_space/Empirical-Influence-Function/sft.jsonl"  # 请确保文件存在
+    JSONL_PATH = "/mnt/nvme0n1/ruofan/git_space/Empirical-Influence-Function/big_data_L_2_5.jsonl"  # 请确保文件存在
     MODEL_ID   = "/mnt/nvme0n1/ruofan/git_space/Empirical-Influence-Function/src/sft/scripts/checkpoint-full"
     RESULTS_JSON_PATH = "/mnt/nvme0n1/ruofan/git_space/Empirical-Influence-Function/experiment_results.jsonl"
 
@@ -798,7 +799,7 @@ def main():
 
     eif = EmpiricalIF(train_loader, model, tokenizer, accelerator, filter_params,
                       debug_on=False)
-    LR = 5e-4
+    LR = 5e-3
     MAX_STEPS = 5
 
     self_ranks = []
@@ -810,7 +811,7 @@ def main():
 
     for i in tqdm(range(len(test_texts)), desc="Running Experiments"):
 
-        # if i not in [1, 2, 3, 4, 5]:
+        # if i not in [48, 19, 5, 22, 38, 39, 41, 12, 29, 3]:
         #     continue
         test_sample_dict = test_texts[i]
 
@@ -860,7 +861,7 @@ def main():
             with open(RESULTS_JSON_PATH, "a", encoding="utf-8") as f:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
-            # # 准备 Top 5 Harmful 数据
+            # # # 准备 Top 5 Harmful 数据
             # top_5_harmful = sorted_results[-5:][::-1]
             # top_5_indices = [idx for idx, score in top_5_harmful]
             # top_5_scores = [score for idx, score in top_5_harmful]

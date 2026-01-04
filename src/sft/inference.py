@@ -125,6 +125,48 @@ def inference_samples(num_samples):
 
         print("=" * 60 + "\n")
 
+@torch.inference_mode()
+def generate_response(model, tokenizer, input_ids, device):
+    input_ids = input_ids.to(device)
+    # 找到 assistant 的起始位置，截取输入部分
+    start_token_id     = tokenizer.convert_tokens_to_ids("<|im_start|>")
+    assistant_token_id = tokenizer.convert_tokens_to_ids("assistant")
+
+    prompt_end_idx = len(input_ids)
+    for i in range(len(input_ids) - 1):
+        if input_ids[i] == start_token_id and input_ids[i + 1] == assistant_token_id:
+            # 输入应包含到 <|im_start|>assistant\n 为止
+            prompt_end_idx = i + 2
+            # 尝试跳过换行
+            if prompt_end_idx < len(input_ids):
+                next_id = input_ids[prompt_end_idx].item()
+                if tokenizer.decode(next_id) in ['\n', 'Ċ', 'Ġ\n']:
+                    prompt_end_idx += 1
+            break
+
+    prompt_ids = input_ids[:prompt_end_idx].unsqueeze(0).to(device)  # 增加 batch 维度
+
+    with torch.no_grad():
+        generated_ids = model.generate(
+            prompt_ids,
+            max_new_tokens=20,  # 可根据需要调整
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.convert_tokens_to_ids("<|im_end|>")
+        )
+
+    # 只解码新生成的 token
+    new_tokens = generated_ids[0][prompt_end_idx:]
+    generated_text = tokenizer.decode(new_tokens, skip_special_tokens=True)
+    return generated_text
+
+
+def get_gen_results(train_dataset, indices, model, tokenizer,):
+    results = {}
+    model.eval()
+    for idx in indices:
+        sample = train_dataset[idx]
+        results[idx] = generate_response(model, tokenizer, sample["input_ids"], model.device)
+    return results
 
 if __name__ == "__main__":
     inference_samples(num_samples=10)

@@ -78,7 +78,9 @@ def strip_text_output(text):
     reformated_text = text.lstrip().replace("\t", "").strip()
     return reformated_text
 
-def process_func_chatml(examples, tokenizer, max_len=2048):
+def process_func_chatml(examples,
+                        tokenizer,
+                        max_len=4096):
     """
     将 input/output 转换为 ChatML 格式：
         <|im_start|>system
@@ -89,7 +91,7 @@ def process_func_chatml(examples, tokenizer, max_len=2048):
         {output}<|im_end|>
     并仅对 assistant 的回复部分计算 Loss。
     """
-    systems  = examples["system"]
+    systems = examples["system"]
     inputs  = examples["input"]
     outputs = examples["output"]
 
