@@ -80,7 +80,7 @@ def strip_text_output(text):
 
 def process_func_chatml(examples,
                         tokenizer,
-                        max_len=4096):
+                        max_len=8192):
     """
     将 input/output 转换为 ChatML 格式：
         <|im_start|>system

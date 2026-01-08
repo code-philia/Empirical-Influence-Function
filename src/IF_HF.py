@@ -427,8 +427,8 @@ def save_query_report_html(
     # 对应的分数列表，用于展示
     all_scores = [score] + top_5_helpful_scores + top_5_harmful_scores
     train_raw_samples = [train_dataset[i] for i in all_indices]
-    ids_list = tokenizer.convert_tokens_to_ids(['Ċ','Ġ', 'Ä'])  # 这里填入你想忽略的 token 字符串
-    ignored_token_ids = torch.tensor(ids_list, device=self.device)
+    ids_list = tokenizer.convert_tokens_to_ids(['Ċ','Ġ', 'Ä', "ĉ"])  # 这里填入你想忽略的 token 字符串
+    ignored_token_ids = torch.tensor(ids_list, device=model.device)
 
     def compute_loss_in_minibatches(samples_list, batch_size=2):
         all_samples_loss_list = []  # 存储每个样本的 1D Tensor
@@ -804,15 +804,15 @@ def main():
 
     self_ranks = []
     self_scores = []
-    if accelerator.is_main_process:
-        if os.path.exists(RESULTS_JSON_PATH):
-            shutil.move(RESULTS_JSON_PATH, f"{RESULTS_JSON_PATH}.bak")
-        logger.info(f"Results will be streamed to {RESULTS_JSON_PATH}")
+    # if accelerator.is_main_process:
+    #     if os.path.exists(RESULTS_JSON_PATH):
+    #         shutil.move(RESULTS_JSON_PATH, f"{RESULTS_JSON_PATH}.bak")
+    #     logger.info(f"Results will be streamed to {RESULTS_JSON_PATH}")
 
     for i in tqdm(range(len(test_texts)), desc="Running Experiments"):
 
-        # if i not in [48, 19, 5, 22, 38, 39, 41, 12, 29, 3]:
-        #     continue
+        if i not in [29, 3, 47, 6, 32, 2, 8, 34, 39, 12]:
+            continue
         test_sample_dict = test_texts[i]
 
         # 临时处理 Query Batch
@@ -858,38 +858,38 @@ def main():
                 "percentile": percentile,
                 "score": float(self_score)  # 确保转为 float 以便 JSON 序列化
             }
-            with open(RESULTS_JSON_PATH, "a", encoding="utf-8") as f:
-                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            # with open(RESULTS_JSON_PATH, "a", encoding="utf-8") as f:
+            #     f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
-            # # # 准备 Top 5 Harmful 数据
-            # top_5_harmful = sorted_results[-5:][::-1]
-            # top_5_indices = [idx for idx, score in top_5_harmful]
-            # top_5_scores = [score for idx, score in top_5_harmful]
-            # # 准备 Top 5 Helpful 数据
-            # top_5_helpful = sorted_results[:5]
-            # top_5_helpful_indices = [idx for idx, score in top_5_helpful]
-            # top_5_helpful_scores = [score for idx, score in top_5_helpful]
-            #
-            # # 保存 HTML 报告
-            # save_query_report_html(
-            #     query_idx=i,
-            #     query_batch=query_batch,  # 传入 Query Batch
-            #     train_dataset=train_ds,  # 传入训练集 Dataset
-            #     rank_pos=rank_pos,
-            #     percentile=percentile,
-            #     score=self_score,
-            #     tokenizer=tokenizer,
-            #     top_5_harmful_indices=top_5_indices,  # Top 5 索引
-            #     top_5_harmful_scores=top_5_scores,  # Top 5 分数
-            #     top_5_helpful_indices=top_5_helpful_indices,  # Top 5 索引
-            #     top_5_helpful_scores=top_5_helpful_scores,  # Top 5 分数
-            #     output_dir="influence_reports",
-            #     lr=LR,
-            #     max_steps=MAX_STEPS,
-            #     model=model,
-            #     collator=collator,
-            #     param_filter_fn=filter_params,
-            # )
+            # # 准备 Top 5 Harmful 数据
+            top_5_harmful = sorted_results[-5:][::-1]
+            top_5_indices = [idx for idx, score in top_5_harmful]
+            top_5_scores = [score for idx, score in top_5_harmful]
+            # 准备 Top 5 Helpful 数据
+            top_5_helpful = sorted_results[:5]
+            top_5_helpful_indices = [idx for idx, score in top_5_helpful]
+            top_5_helpful_scores = [score for idx, score in top_5_helpful]
+
+            # 保存 HTML 报告
+            save_query_report_html(
+                query_idx=i,
+                query_batch=query_batch,  # 传入 Query Batch
+                train_dataset=train_ds,  # 传入训练集 Dataset
+                rank_pos=rank_pos,
+                percentile=percentile,
+                score=self_score,
+                tokenizer=tokenizer,
+                top_5_harmful_indices=top_5_indices,  # Top 5 索引
+                top_5_harmful_scores=top_5_scores,  # Top 5 分数
+                top_5_helpful_indices=top_5_helpful_indices,  # Top 5 索引
+                top_5_helpful_scores=top_5_helpful_scores,  # Top 5 分数
+                output_dir="influence_reports",
+                lr=LR,
+                max_steps=MAX_STEPS,
+                model=model,
+                collator=collator,
+                param_filter_fn=filter_params,
+            )
 
             # 转换为 numpy 数组方便计算
             ranks_arr = np.array(self_ranks)

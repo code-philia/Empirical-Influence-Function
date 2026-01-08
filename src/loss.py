@@ -63,6 +63,23 @@ def compute_loss_per_sample(model, batch, device, ignored_token_ids):
 
     return mean_loss, token_losses
 
+@torch.no_grad()
+def compute_loss_in_minibatches(model, collator, samples_list, ignored_token_ids, batch_size=2):
+    all_samples_loss_list = []  # 存储每个样本的 1D Tensor
+    for i in range(0, len(samples_list), batch_size):
+        batch_samples = samples_list[i: i + batch_size]
+        batch = collator(batch_samples)
+        batch = {k: v.to(model.device) for k, v in batch.items() if isinstance(v, torch.Tensor)} # 移到 GPU
+
+        with torch.no_grad():
+            _, token_loss = compute_loss_per_sample(model, batch, model.device, ignored_token_ids)
+
+        # 立即上 CPU
+        token_loss_cpu = token_loss.detach().cpu()
+        all_samples_loss_list.extend(token_loss_cpu.unbind(0))
+        del batch
+
+    return all_samples_loss_list
 
 def compute_gradients(
         model,
@@ -88,3 +105,90 @@ def compute_gradients(
 
         grads = torch.autograd.grad(loss, params, create_graph=False)
     return list(grads)
+
+
+def compute_token_specific_update(
+        model,
+        batch,
+        param_filter_fn,
+        device,
+        ignored_token_ids,
+        target_sequence_idx: int,
+        lr: float
+):
+    """
+    针对 query_batch 中特定序列索引的 token 计算梯度，并应用一次更新。
+    """
+    model.zero_grad(set_to_none=True)
+
+    # 1. 前向传播
+    inputs = {k: v.to(device) for k, v in batch.items() if k in ['input_ids', 'attention_mask', 'labels']}
+    outputs = model(**inputs, return_dict=True)
+    logits = outputs.logits.float()
+
+    # 2. 错位和屏蔽 (与 compute_loss_per_sample 逻辑相似)
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = inputs["labels"][..., 1:].contiguous().clone()
+
+    if ignored_token_ids is not None and len(ignored_token_ids) > 0:
+        mask_to_ignore = torch.isin(shift_labels, ignored_token_ids.cpu())  # 确保在 CPU 上比较
+        shift_labels[mask_to_ignore] = -100
+
+    # 3. 提取单 Token Loss
+    loss_fct = nn.CrossEntropyLoss(reduction='none', ignore_index=-100)
+    token_losses_flat = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+    token_losses = token_losses_flat.view(shift_labels.size())
+
+    # 4. 选取目标 Token 的损失并进行 Backward
+    # 确保索引在范围内
+    loss_index_in_shifted = target_sequence_idx - 1
+
+    if loss_index_in_shifted >= shift_logits.shape[1] or loss_index_in_shifted < 0:
+        raise IndexError(f"Warning: Token index {loss_index_in_shifted} out of bounds.")
+
+    # 仅对该 Token 的损失进行反向传播
+    single_token_loss = token_losses[0, loss_index_in_shifted]  # 假设 batch_size=1
+
+    # 仅在损失有效时才反向传播（避免对 -100 的位置求导）
+    if single_token_loss.item() != 0 or shift_labels[0, target_sequence_idx].item() != -100:
+        single_token_loss.backward()
+
+        # 5. 收集梯度并应用更新
+        params = [p for n, p in model.named_parameters() if
+                  p.requires_grad and (param_filter_fn is None or param_filter_fn(n, p))]
+        grads = [p.grad for p in params]  # 直接使用 .grad
+
+        return grads
+
+    raise IndexError(f"Warning: Token index has label mask as -100.")
+
+
+@torch.inference_mode()
+def get_first_response_token(
+        batch,
+        ignored_token_ids,
+):
+    # 找到第一个未被忽略（即需要计算损失）的 Token 索引
+    labels_shifted = batch["labels"][0, 1:].cpu()
+
+    effective_ignored_ids = ignored_token_ids.cpu() if ignored_token_ids is not None and ignored_token_ids.numel() > 0 else torch.tensor([])
+    is_valid = labels_shifted.ne(-100)
+    if effective_ignored_ids.numel() > 0:
+        is_valid = is_valid & ~torch.isin(labels_shifted, effective_ignored_ids)
+
+    # 找到第一个为 True 的索引
+    valid_indices = torch.where(is_valid)[0]
+    if valid_indices.numel() == 0:
+        print(f"Could not find any valid response token. Skipping report generation.")
+        return None, None
+
+    # query_response_start_idx_in_shifted_labels 是响应在 shift_labels 中的起始索引
+    response_start_idx_in_shifted_labels = valid_indices[0].item()
+
+    # 序列总长度 (shift_labels 的长度)
+    total_shifted_len = labels_shifted.shape[0]
+
+    # 响应的有效长度
+    query_response_len = total_shifted_len - response_start_idx_in_shifted_labels
+    print(f"Dynamically determined Query Response Length: {query_response_len}")
+    return response_start_idx_in_shifted_labels, query_response_len

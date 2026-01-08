@@ -15,6 +15,8 @@ import numpy as np
 from utils import utils
 from utils import training_datasets
 from peft import get_peft_model, PeftConfig
+import pathlib
+
 IGNORE_INDEX = -100 #default ignore_index = 100 in transformers
 logging.basicConfig(level=logging.DEBUG)  
 
@@ -224,7 +226,12 @@ def train():
         **data_module, 
         callbacks=[LoggingCallback, SaveModelCallback]
     )
-    trainer.train()
+
+    if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
+        print("checkpoint found, resume training")
+        trainer.train(resume_from_checkpoint=True)
+    else:
+        trainer.train()
     trainer.save_state()
     trainer.save_model(output_dir=training_args.output_dir)
 
