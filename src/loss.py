@@ -190,5 +190,4 @@ def get_first_response_token(
 
     # 响应的有效长度
     query_response_len = total_shifted_len - response_start_idx_in_shifted_labels
-    print(f"Dynamically determined Query Response Length: {query_response_len}")
     return response_start_idx_in_shifted_labels, query_response_len
