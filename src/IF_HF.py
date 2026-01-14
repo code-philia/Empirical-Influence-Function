@@ -811,8 +811,8 @@ def main():
         # if i not in [23, 34, 3]: #
         # if i not in [32, ]: # good examples , 43, 0
         #     continue
-        if i not in [17, 3, 34, 13, 38]:
-            continue
+        # if i not in [17, 3, 34, 13, 38]:
+        #     continue
         test_sample_dict = test_texts[i]
 
         # 临时处理 Query Batch
@@ -864,35 +864,35 @@ def main():
             with open(RESULTS_JSON_PATH, "a", encoding="utf-8") as f:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
-            # # 准备 Top 5 Harmful 数据
-            top_1_harmful = sorted_results[-1:][::-1]
-            top_1_indices = [idx for idx, score in top_1_harmful]
-            top_1_scores = [score for idx, score in top_1_harmful]
-
-            top_1_helpful = sorted_results[-1:]
-            top_1_helpful_indices = [idx for idx, score in top_1_helpful]
-            top_1_helpful_scores = [score for idx, score in top_1_helpful]
-
-            # 保存 HTML 报告
-            save_query_report_html_attn(
-                query_idx=i,
-                query_batch=query_batch,  # 传入 Query Batch
-                train_dataset=train_ds,  # 传入训练集 Dataset
-                rank_pos=rank_pos,
-                percentile=percentile,
-                score=self_score,
-                tokenizer=tokenizer,
-                top_5_harmful_indices=top_1_indices,  # Top 5 索引
-                top_5_harmful_scores=top_1_scores,  # Top 5 分数
-                top_5_helpful_indices=top_1_helpful_indices,  # Top 5 索引
-                top_5_helpful_scores=top_1_helpful_scores,  # Top 5 分数
-                output_dir=VIS_DIR,
-                lr=LR,
-                max_steps=MAX_STEPS,
-                model=model,
-                collator=collator,
-                param_filter_fn=filter_params,
-            )
+            # # # 准备 Top 5 Harmful 数据
+            # top_1_harmful = sorted_results[-1:][::-1]
+            # top_1_indices = [idx for idx, score in top_1_harmful]
+            # top_1_scores = [score for idx, score in top_1_harmful]
+            #
+            # top_1_helpful = sorted_results[-1:]
+            # top_1_helpful_indices = [idx for idx, score in top_1_helpful]
+            # top_1_helpful_scores = [score for idx, score in top_1_helpful]
+            #
+            # # 保存 HTML 报告
+            # save_query_report_html_attn(
+            #     query_idx=i,
+            #     query_batch=query_batch,  # 传入 Query Batch
+            #     train_dataset=train_ds,  # 传入训练集 Dataset
+            #     rank_pos=rank_pos,
+            #     percentile=percentile,
+            #     score=self_score,
+            #     tokenizer=tokenizer,
+            #     top_5_harmful_indices=top_1_indices,  # Top 5 索引
+            #     top_5_harmful_scores=top_1_scores,  # Top 5 分数
+            #     top_5_helpful_indices=top_1_helpful_indices,  # Top 5 索引
+            #     top_5_helpful_scores=top_1_helpful_scores,  # Top 5 分数
+            #     output_dir=VIS_DIR,
+            #     lr=LR,
+            #     max_steps=MAX_STEPS,
+            #     model=model,
+            #     collator=collator,
+            #     param_filter_fn=filter_params,
+            # )
 
             # 转换为 numpy 数组方便计算
             ranks_arr = np.array(self_ranks)
