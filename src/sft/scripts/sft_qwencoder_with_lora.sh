@@ -1,16 +1,14 @@
 #!/bin/bash
 
 SCRIPT_PATH=$(readlink -f "$0")
-# 获取脚本所在的目录: .../Empirical-Influence-Function/src/sft/scripts
 SCRIPT_DIR=$(dirname "$SCRIPT_PATH")
 
 # 根据你的目录结构推算根目录:
-# scripts -> sft -> src -> PROJECT_ROOT (向上跳三级)
 PROJECT_ROOT=$(cd "$SCRIPT_DIR/../../.." && pwd)
 
 # --- 基于项目根目录定义其他路径 ---
 SRC_DIR="$PROJECT_ROOT/src/sft"
-DATA_PATH="$PROJECT_ROOT/sft-processed.jsonl"
+DATA_PATH="$PROJECT_ROOT/sft_processed_train.jsonl"
 OUTPUT_DIR="$SCRIPT_DIR/checkpoints" # 放在脚本同级的 checkpoints 目录下
 
 # 配置文件通常在脚本目录的 configs 下
