@@ -14,6 +14,10 @@ class Color:
     END = '\033[0m'      # 重置颜色
 
 
+def restore_escaped_characters(text: str):
+    return text.encode().decode('unicode_escape')
+
+
 def print_side_by_side(gt_text, model_text, width=50):
     """
     将两条文本并排打印。
@@ -48,7 +52,7 @@ def print_side_by_side(gt_text, model_text, width=50):
 
 def inference_samples(num_samples):
 
-    model_path = "./src/sft/scripts/checkpoint-full"
+    model_path = "./src/sft/scripts/checkpoint-full-long"
     print(f"Loading model from {model_path}...")
 
     tokenizer = AutoTokenizer.from_pretrained(model_path)
@@ -116,12 +120,13 @@ def inference_samples(num_samples):
         response_text = tokenizer.decode(response_ids, skip_special_tokens=True).strip()
 
         # 5. 结构化打印对比
+        # 只有在打印的时候还原所有的 \n \t
         print("=" * 60)
         print(f"{Color.BOLD}【Sample Index】: {idx}{Color.END}")
-        print(f"【Input Prompt】:\n{readable_prompt}")
+        print(f"【Input Prompt】:\n{restore_escaped_characters(readable_prompt)}")
         print("-" * 30)
 
-        print_side_by_side(gt_text, response_text, width=60)
+        print_side_by_side(restore_escaped_characters(gt_text), restore_escaped_characters(response_text), width=60)
 
         print("=" * 60 + "\n")
 
