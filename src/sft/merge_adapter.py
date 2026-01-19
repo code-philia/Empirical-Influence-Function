@@ -28,7 +28,7 @@ def merge_adapter(base_model_path, adapter_dir, output_path):
 def parse_args():
     parser = argparse.ArgumentParser(description='Argument Parser Example')
     parser.add_argument('--base_model_path', '-base_model_path', type=str, default="Qwen/Qwen2.5-Coder-1.5B-Instruct", help='Path to model')
-    parser.add_argument('--train_adapters_path', '-train_adapters_path', type=str, default="./src/sft/scripts/checkpoints/checkpoint-3000", help='Path to adapter folder')
+    parser.add_argument('--train_adapters_path', '-train_adapters_path', type=str, default="./src/sft/scripts/checkpoints/", help='Path to adapter folder')
     parser.add_argument('--output_path', '-output_path', type=str, default="./src/sft/scripts/checkpoint-full-long", help='Path to output folder')
     return parser.parse_args()
 

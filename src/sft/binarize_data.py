@@ -180,7 +180,7 @@ def tokenize_file(workers=64, chunk_size=10000, input_path="./raw/sft.jsonl", ou
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Argument Parser Example')
-    parser.add_argument('--input_path', '-input_path', type=str, default="../../sft.jsonl", help='Path to input file')
+    parser.add_argument('--input_path', '-input_path', type=str, default="../../sft_train.jsonl", help='Path to input file')
     parser.add_argument('--output_path', '-output_path', type=str, default="../../sft-processed.jsonl", help='Path to output file')
     parser.add_argument('--workers', '-workers', type=int, default=64, help='Number of workers')
     parser.add_argument('--chunk_size', '-chunk_size', type=float, default=0.1 * 2 ** 30, help='Chunk size for file processing')

@@ -5,6 +5,8 @@ from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from .utils import training_datasets
 import textwrap
+import difflib
+import json
 
 class Color:
     GREEN = '\033[92m'   # 绿色
@@ -64,7 +66,7 @@ def inference_samples(num_samples):
 
     dataset = training_datasets.SupervisedDataset(
         tokenizer=tokenizer,
-        data_path="./sft-processed.jsonl",
+        data_path="./sft_processed_test.jsonl",
         args=argparse.Namespace(**{
             "model_max_length": 1280,
             "truncate_source": False
@@ -164,6 +166,109 @@ def generate_response(model, tokenizer, input_ids, device):
     generated_text = tokenizer.decode(new_tokens, skip_special_tokens=True)
     return generated_text
 
+def calculate_similarity(text_a, text_b):
+    """
+    Calculates a similarity score between 0.0 and 1.0.
+    1.0 means exact match.
+    """
+    return difflib.SequenceMatcher(None, text_a, text_b).ratio()
+
+def find_error_samples(output_file="bad_cases.json", similarity_threshold=0.7):
+    """
+    Scans the dataset, generates responses, and saves cases where
+    similarity(GT, Prediction) < threshold.
+    """
+    model_path = "./src/sft/scripts/checkpoint-full-long"
+    print(f"Loading model from {model_path}...")
+
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        device_map="auto",
+        torch_dtype=torch.bfloat16
+    ).eval()
+
+    dataset = training_datasets.SupervisedDataset(
+        tokenizer=tokenizer,
+        data_path="./sft_processed_test.jsonl",
+        args=argparse.Namespace(**{
+            "model_max_length": 8192,
+            "truncate_source": False
+        })
+    )
+
+    print(f"Scanning {len(dataset)} samples for errors (Threshold < {similarity_threshold})...")
+
+    # Prepare token tensors for splitting
+    assistant_start_token = tokenizer.encode("<|im_start|>assistant", add_special_tokens=False)
+    assistant_start_tensor = torch.tensor(assistant_start_token)
+
+    bad_cases = []
+
+    # Iterate through ALL samples (or use tqdm(range(100)) for a quick test)
+    for idx in tqdm(range(len(dataset))):
+        data_item = dataset[idx]
+        input_ids_full = data_item["input_ids"]
+
+        # --- 1. Find the split point between Prompt and GT ---
+        break_idx = -1
+        # Optimized search: usually the assistant token is near the end of prompt,
+        # but a linear scan is fine for inference
+        for i in range(len(input_ids_full) - len(assistant_start_tensor) + 1):
+            if torch.equal(input_ids_full[i:i + len(assistant_start_tensor)], assistant_start_tensor):
+                break_idx = i + len(assistant_start_tensor)
+                break
+
+        if break_idx == -1:
+            continue  # Skip malformed data
+
+        prompt_ids = input_ids_full[:break_idx].unsqueeze(0).to(model.device)
+
+        # Extract Ground Truth Text
+        gt_ids = input_ids_full[break_idx:]
+        if tokenizer.pad_token_id is not None:
+            gt_ids = gt_ids[gt_ids != tokenizer.pad_token_id]
+        gt_text = tokenizer.decode(gt_ids, skip_special_tokens=True).strip()
+
+        # --- 2. Generate Prediction ---
+        with torch.no_grad():
+            generated_ids = model.generate(
+                prompt_ids,
+                max_new_tokens=512,
+                eos_token_id=tokenizer.eos_token_id,
+                pad_token_id=tokenizer.pad_token_id
+            )
+
+        response_ids = generated_ids[0][prompt_ids.shape[-1]:]
+        response_text = tokenizer.decode(response_ids, skip_special_tokens=True).strip()
+
+        # --- 3. Compare and Filter ---
+        score = calculate_similarity(gt_text, response_text)
+
+        if score < similarity_threshold:
+            # Decode prompt for readability in the log file
+            readable_prompt = tokenizer.decode(prompt_ids[0], skip_special_tokens=False)
+
+            error_entry = {
+                "index": idx,
+                "input_ids": data_item["input_ids"].tolist(),
+                "labels": data_item["labels"].tolist(),
+                "score": round(score, 4),
+                "prompt": readable_prompt,
+                "ground_truth": gt_text,
+                "prediction": response_text
+            }
+            bad_cases.append(error_entry)
+
+            # Optional: Print it live if you want to see progress
+            # print(f"Found error at idx {idx} | Score: {score:.2f}")
+
+    # --- 4. Save Results ---
+    with open(output_file, "w", encoding="utf-8") as f:
+        json.dump(bad_cases, f, indent=2, ensure_ascii=False)
+
+    print(f"\nScanning complete. Found {len(bad_cases)} bad cases.")
+    print(f"Saved details to {output_file}")
 
 def get_gen_results(train_dataset, indices, model, tokenizer,):
     results = {}
@@ -174,4 +279,6 @@ def get_gen_results(train_dataset, indices, model, tokenizer,):
     return results
 
 if __name__ == "__main__":
-    inference_samples(num_samples=10)
+    # inference_samples(num_samples=10)
+
+    find_error_samples(output_file="wrong_predictions_test.json", similarity_threshold=0.6)
