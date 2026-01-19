@@ -8,3 +8,10 @@ rembg
 numpy
 argparse
 Pillow
+transformers
+jsonlines
+pandas
+datasets
+accelerate
+tree_sitter
+tree_sitter_go
