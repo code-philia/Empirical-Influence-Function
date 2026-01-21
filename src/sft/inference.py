@@ -17,7 +17,9 @@ class Color:
 
 
 def restore_escaped_characters(text: str):
-    return text.encode().decode('unicode_escape')
+    text = text.encode().decode('unicode_escape')
+    text = text.replace('\t', '  ')
+    return text
 
 
 def print_side_by_side(gt_text, model_text, width=50):
@@ -51,6 +53,42 @@ def print_side_by_side(gt_text, model_text, width=50):
         left_col  = f"{Color.GREEN}{gt.ljust(width)}{Color.END}"
         right_col = f"{Color.BLUE}{model.ljust(width)}{Color.END}"
         print(f"{left_col} | {right_col}")
+
+def print_query_and_answer(query, gt_text, model_text="", width=70):
+    print(f"{Color.BOLD}[[[ Query Example ]]]{Color.END}")
+    print(restore_escaped_characters(query))
+
+    gt_text = restore_escaped_characters(gt_text)
+    model_text = restore_escaped_characters(model_text)
+
+    # 1. 处理换行，确保每行不超过指定宽度
+    gt_lines = []
+    for line in gt_text.splitlines():
+        gt_lines.extend(textwrap.wrap(line, width=width) if line.strip() else [""])
+
+    model_lines = []
+    for line in model_text.splitlines():
+        model_lines.extend(textwrap.wrap(line, width=width) if line.strip() else [""])
+
+    # 2. 补齐行数，使其对齐
+    max_len = max(len(gt_lines), len(model_lines))
+    gt_lines    += [""] * (max_len - len(gt_lines))
+    model_lines += [""] * (max_len - len(model_lines))
+
+    # 3. 打印标题
+    header_gt    = f"{Color.BOLD}{Color.GREEN}{'GROUND TRUTH'.center(width)}{Color.END}"
+    header_model = f"{Color.BOLD}{Color.BLUE}{'MODEL RESPONSE'.center(width)}{Color.END}"
+    print(f"\n{header_gt} | {header_model}")
+    print("-" * (width * 2 + 3))
+
+    # 4. 逐行并排打印
+    for gt, model in zip(gt_lines, model_lines):
+        # 使用 ljust 确保左侧列对齐
+        left_col  = f"{Color.GREEN}{gt.ljust(width)}{Color.END}"
+        right_col = f"{Color.BLUE}{model.ljust(width)}{Color.END}"
+        print(f"{left_col} | {right_col}")
+    
+    print("")
 
 def inference_samples(num_samples):
 

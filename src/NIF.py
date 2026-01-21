@@ -1,11 +1,16 @@
 from functools import partial
+from heapq import nlargest
 import json
 import os
+from pprint import pprint
 import torch
 from torch import nn
+from tqdm import tqdm
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, DataCollatorForSeq2Seq, Qwen2ForCausalLM, set_seed
 from accelerate import Accelerator
+
+from src.sft.inference import print_query_and_answer
 
 from .process_data import CustomCollator, list_of_dicts_to_dict_of_lists as dataset_list_to_dict, process_func_chatml
 from .loss import compute_gradients, compute_gradients_selected_attention, compute_loss_per_sample, compute_loss_per_sample_selected_attention
@@ -304,8 +309,8 @@ class NewInferenceFunction:
             attention_mask=trimmed_mask,
             max_new_tokens=gen_limit,
             do_sample=False,
-            eos_token_id=self.tokenizer.eos_token_id,
-            pad_token_id=self.tokenizer.eos_token_id,
+            eos_token_id=[self.tokenizer.eos_token_id, self.tokenizer.pad_token_id],
+            pad_token_id=self.tokenizer.pad_token_id
         )
 
         pred_ids, pred_text = [], []
@@ -351,7 +356,10 @@ class NewInferenceFunction:
         with torch.inference_mode():
             if not isinstance(self.train_loader, DataLoader):
                 raise TypeError("Expected `self.train_loader` to be an `DataLoader`.")
-            for batch in self.train_loader:
+            pbar = tqdm(self.train_loader, desc=f"Getting Train Losses", leave=False)
+            loss = 1.0
+            for batch in pbar:
+                pbar.set_postfix(loss=f"{loss:.4f}")
                 batch_gpu = {k: v.to(self.device) for k, v in batch.items()}
                 mean_loss, token_loss = compute_loss_per_sample(
                     self.model,
@@ -371,6 +379,7 @@ class NewInferenceFunction:
                 all_sum_losses.append(mean_loss.detach().cpu())
                 all_indices.append(batch_gpu["sample_index"].detach().cpu())
 
+                loss = mean_loss.item()
                 del batch_gpu, mean_loss, token_loss, shift_labels  # crucial release
 
         return torch.cat(all_sum_losses), torch.cat(all_indices), tokenwise_dict
@@ -405,17 +414,20 @@ class NewInferenceFunction:
 
         # Compute starting loss
         with torch.no_grad():
-            l_test_base_scalar, l_test_base_tokenwise_raw = compute_loss_per_sample_selected_attention(
-                self.model, query_batch, self.device, self.ignored_token_ids, top_k=top_k
+            scalar, tokenwise_raw = compute_loss_per_sample(
+                self.model, query_batch, self.device, self.ignored_token_ids
             )
-            l_test_base = l_test_base_scalar.item()
-            l_test_base_tokenwise = l_test_base_tokenwise_raw[0][start_q:].cpu()
+            loss_test_start = scalar.item()
+            loss_test_start_tokenwise = tokenwise_raw[0][start_q:].cpu()
 
         snapshot = self._get_param_snapshot(self.model, self.param_filter_fn)
 
-        # Training
-        curr_test_loss = l_test_base
-        for _ in range(max_steps):
+        # Overfitting
+        curr_test_loss = loss_test_start
+        pbar = tqdm(range(max_steps), desc=f"Overfitting on single sample", leave=False)
+        for step in pbar:
+            pbar.set_postfix(loss=f"{curr_test_loss:.4f}")
+
             if curr_test_loss < loss_threshold:
                 break
 
@@ -426,21 +438,21 @@ class NewInferenceFunction:
             self.model.zero_grad(set_to_none=True)
 
             with torch.no_grad():
-                loss_s, _ = compute_loss_per_sample_selected_attention(
-                    self.model, query_batch, self.device, self.ignored_token_ids, top_k=top_k
+                scalar, _ = compute_loss_per_sample(
+                    self.model, query_batch, self.device, self.ignored_token_ids
                 )
-                curr_test_loss = loss_s.item()
+                curr_test_loss = scalar.item()
 
         # Compute ending loss
         with torch.no_grad():
-            _, l_test_des_tokenwise_raw = compute_loss_per_sample_selected_attention(
-                self.model, query_batch, self.device, self.ignored_token_ids, top_k=top_k
+            _, l_test_des_tokenwise_raw = compute_loss_per_sample(
+                self.model, query_batch, self.device, self.ignored_token_ids
             )
-            l_test_des_tokenwise = l_test_des_tokenwise_raw[0][start_q:].cpu()
+            loss_test_end_tokenwise = l_test_des_tokenwise_raw[0][start_q:].cpu()
 
         # Test loss diff
-        query_token_diffs = l_test_des_tokenwise - l_test_base_tokenwise
-        delta_test = curr_test_loss - l_test_base
+        query_token_diffs = loss_test_end_tokenwise - loss_test_start_tokenwise
+        delta_test = curr_test_loss - loss_test_start
 
         # Train loss diff
         l_train_des_sum, _, l_train_des_tokenwise = self._get_train_losses()
@@ -532,19 +544,50 @@ def main():
 
     # 1) Masked inference for one wrong sample
     result = infer.masked_inference(query_batch)
-    print(">>> Prev text:\n", result["prev_text"][0].encode().decode('unicode_escape'), sep="")
-    print(">>> Answer text:\n", result["answer_text"][0].encode().decode('unicode_escape'), sep="")
-    print(">>> Pred text:\n", result["pred_text"][0].encode().decode('unicode_escape'), sep="")
+    print_query_and_answer(result["prev_text"][0], result["answer_text"][0], result["pred_text"][0])
 
-    # 2) Empirical influence (overfit on one wrong sample)
+    # 2) Rebuild query batch using prediction as new ground truth
+    prompt_len = int(result["target_idx"][0].item())
+    prompt_ids = query_batch["input_ids"][0, :prompt_len]
+    pred_ids = torch.tensor(
+        result["pred_ids"][0],
+        device=prompt_ids.device,
+        dtype=prompt_ids.dtype
+    )
+    new_input_ids = torch.cat([prompt_ids, pred_ids], dim=0).unsqueeze(0)
+    new_attention_mask = torch.ones_like(new_input_ids)
+    new_labels = new_input_ids.clone()
+    new_labels[:, :prompt_len] = -100  # ignore prompt tokens in loss
+
+    query_batch = {
+        "input_ids": new_input_ids,
+        "attention_mask": new_attention_mask,
+        "labels": new_labels
+    }
+
+    # 3) Empirical influence (overfit on the new ground-truth batch)
     scores, indices, train_diffs, query_diffs = infer.influence_overfit_single(
         query_batch=query_batch,
         lr=5e-3,
-        max_steps=20,
+        max_steps=50,
         target_idx=result["target_idx"]
     )
 
-    print(scores)
+    result = nlargest(10, enumerate(scores), key=lambda x: x[1])
+    pprint(result)
+
+    print(">>> Top-10 related training samples\n")
+    for i, sim in result:
+        # Build query batch
+        temp_ds = build_single_sample_query_batch(train_samples[i], convert_to_chatml_with_tokenizer)    # choose a proper length sample, or it will cuda oom
+        query_batch = base_collator([temp_ds[0]])
+
+        for k, v in query_batch.items():
+            query_batch[k] = v.to(accelerator.device)
+
+        result = infer.masked_inference(query_batch)
+        print_query_and_answer(result["prev_text"][0], result["answer_text"][0], result["pred_text"][0])
+
 
 
 if __name__ == "__main__":

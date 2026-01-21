@@ -119,7 +119,7 @@ def compute_loss_per_sample_selected_attention(model, batch, device, ignored_tok
     return mean_loss, weighted_token_losses
 
 
-def compute_answer_only_weighted_loss(
+def compute_answer_only_union_topk_loss(
     model,
     batch,
     device,
@@ -128,6 +128,7 @@ def compute_answer_only_weighted_loss(
     ignored_token_ids=None,
     *,
     enable_grad: bool = False,
+    renormalize: bool = True,
 ):
     if ignored_token_ids is not None and not isinstance(ignored_token_ids, torch.Tensor):
         ignored_token_ids = torch.tensor(ignored_token_ids, device=device)
@@ -146,18 +147,29 @@ def compute_answer_only_weighted_loss(
             save_last_attention=True,
             use_cache=False,
         )
+
     logits = outputs.logits
-    attn = outputs.attentions[-1].detach()  # crucial: avoid keeping attn graph
+    attn = outputs.attentions[-1].detach()
     del outputs
 
     bsz, n_heads, q_len, k_len = attn.shape
     k = min(top_k, k_len)
+    attn_avg = attn.mean(dim=1)  # [B, Q, K]
 
-    topk_indices = torch.topk(attn, k=k, dim=-1, largest=True).indices
-    keep = torch.zeros_like(attn, dtype=torch.bool)
-    keep.scatter_(-1, topk_indices, True)
+    q_from = max(start, 0)
+    if q_from >= q_len:
+        raise ValueError("target_idx is beyond sequence length.")
 
-    token_weights = (attn * keep).sum(dim=-1).mean(dim=1).detach()  # crucial: no grad here
+    topk_indices = torch.topk(attn_avg[:, q_from:, :], k=k, dim=-1).indices
+    union_mask = torch.zeros((bsz, k_len), device=attn.device, dtype=torch.bool)
+    union_mask.scatter_(1, topk_indices.reshape(bsz, -1), True)
+
+    masked_attn = attn_avg * union_mask[:, None, :]
+    if renormalize:
+        masked_attn = masked_attn / (masked_attn.sum(dim=-1, keepdim=True) + 1e-9)
+
+    token_weights = torch.zeros_like(attn_avg)
+    token_weights[:, q_from:, :] = masked_attn[:, q_from:, :].detach()
 
     shift_logits = logits[..., :-1, :].contiguous()
     shift_labels = labels[..., 1:].contiguous()
@@ -169,10 +181,109 @@ def compute_answer_only_weighted_loss(
     token_losses = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
     token_losses = token_losses.view(shift_labels.size())
 
-    weighted_token_losses = token_losses * token_weights[..., :-1].contiguous()
-    valid = shift_labels.ne(-100).float()
-    mean_loss = weighted_token_losses.sum(dim=1) / (valid.sum(dim=1) + 1e-9)
+    weights = token_weights[..., :-1].contiguous()
+    mask = shift_labels.ne(-100)
+    weights = weights * mask
+
+    weighted_token_losses = token_losses * weights
+    denom = weights.sum(dim=1).clamp_min(1e-9)
+    mean_loss = weighted_token_losses.sum(dim=1) / denom
     return mean_loss, weighted_token_losses
+
+
+def compute_answer_only_saliency_masked_loss(
+    model,
+    batch,
+    device,
+    target_idx,
+    top_k: int = 10,
+    ignored_token_ids=None,
+    *,
+    enable_grad: bool = True,
+    renormalize: bool = True,
+):
+    if ignored_token_ids is not None and not isinstance(ignored_token_ids, torch.Tensor):
+        ignored_token_ids = torch.tensor(ignored_token_ids, device=device)
+    elif ignored_token_ids is not None:
+        ignored_token_ids = ignored_token_ids.to(device)
+
+    # 1. Forward
+    inputs = {k: v.to(device) for k, v in batch.items() if k in ["input_ids", "attention_mask", "labels"]}
+    input_ids = inputs["input_ids"]
+    attn_mask = inputs["attention_mask"]
+    labels = inputs["labels"].clone()
+
+    start = int(target_idx[0].item())
+    labels[..., :start] = -100
+
+    with torch.set_grad_enabled(enable_grad):
+        outputs = model(
+            **inputs,
+            return_dict=True,
+            save_last_attention=True,
+            use_cache=False,
+        )
+
+    logits = outputs.logits
+    attn = outputs.attentions[-1].detach()
+    del outputs
+
+    bsz, n_heads, q_len, k_len = attn.shape
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = labels[..., 1:].contiguous()
+
+    if ignored_token_ids is not None and len(ignored_token_ids) > 0:
+        shift_labels[torch.isin(shift_labels, ignored_token_ids)] = -100
+
+    loss_fct = nn.CrossEntropyLoss(reduction="none", ignore_index=-100)
+    token_losses = loss_fct(shift_logits.reshape(-1, shift_logits.size(-1)), shift_labels.reshape(-1))
+    token_losses = token_losses.reshape(shift_labels.size())
+
+    # 2. Compute saliency
+    weights = torch.zeros_like(shift_labels, dtype=attn.dtype, device=device)
+    q_from = max(start, 1)
+
+    for t in range(q_from, q_len):
+        if (shift_labels[:, t - 1] == -100).all():
+            continue
+
+        curr_input_ids = input_ids[:, :t]
+        curr_attn_mask = attn_mask[:, :t]
+        target_ids = labels[:, t]
+
+        with torch.enable_grad():
+            embeddings = model.get_input_embeddings()(curr_input_ids).detach().requires_grad_(True)
+            step_outputs = model(inputs_embeds=embeddings, attention_mask=curr_attn_mask, use_cache=False)
+            target_logit = step_outputs.logits.gather(-1, target_ids[:, None, None]).squeeze(-1).squeeze(-1)
+            grads = torch.autograd.grad(target_logit.sum(), embeddings, retain_graph=False, create_graph=False)[0]
+
+        saliency = (embeddings * grads).sum(dim=-1).abs()
+        k = min(top_k, saliency.size(-1))
+        topk_idx = torch.topk(saliency, k=k, dim=-1).indices
+
+        mask_ctx = torch.zeros_like(saliency, dtype=torch.bool)
+        mask_ctx.scatter_(1, topk_idx, True)
+
+        full_mask = torch.zeros((bsz, k_len), device=device, dtype=torch.bool)
+        full_mask[:, :t] = mask_ctx
+
+        q_pos = t - 1
+        attn_q = attn[:, :, q_pos, :]
+        masked_attn = attn_q * full_mask[:, None, :]
+
+        if renormalize:
+            masked_attn = masked_attn / (masked_attn.sum(dim=-1, keepdim=True) + 1e-9)
+
+        weights[:, q_pos] = masked_attn.sum(dim=-1).mean(dim=1) # normalization
+
+    # 3. Multiply to get the loss
+    weights = weights.detach()
+    weighted_token_losses = token_losses * weights
+
+    denom = weights.sum(dim=1).clamp_min(1e-9)
+    mean_loss = weighted_token_losses.sum(dim=1) / denom
+    return mean_loss, weighted_token_losses
+
 
 @torch.no_grad()
 def compute_loss_in_minibatches(model, collator, samples_list, ignored_token_ids, batch_size=2):
@@ -243,7 +354,7 @@ def compute_gradients_selected_attention(
         p.requires_grad_(True)
 
     with torch.enable_grad():
-        mean_loss, _ = compute_answer_only_weighted_loss(
+        mean_loss, _ = compute_answer_only_union_topk_loss(
             model,
             batch,
             device,
