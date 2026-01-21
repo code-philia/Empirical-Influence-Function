@@ -6,7 +6,7 @@ import logging
 from typing import List, Dict, Callable, Optional, Any
 from torch import nn
 from torch.utils.data import DataLoader
-from transformers import AutoModelForCausalLM, AutoTokenizer, DataCollatorForSeq2Seq
+from transformers import AutoModelForCausalLM, AutoTokenizer, DataCollatorForSeq2Seq, Qwen2ForCausalLM
 from datasets import Dataset
 from functools import partial
 import json
@@ -33,7 +33,8 @@ def compute_loss_per_sample(model, batch, device, ignored_token_ids):
         ignored_token_ids = ignored_token_ids.to(device)
 
     inputs = {k: v.to(device) for k, v in batch.items() if k in ['input_ids', 'attention_mask', 'labels']}
-    outputs = model(**inputs, return_dict=True)
+    with torch.inference_mode():
+        outputs = model(**inputs, return_dict=True, output_attentions=False, use_cache=False)
     logits = outputs.logits.float()
 
     # 1. 进行错位
@@ -62,6 +63,116 @@ def compute_loss_per_sample(model, batch, device, ignored_token_ids):
     mean_loss = sum_loss / (num_valid + 1e-9)
 
     return mean_loss, token_losses
+
+
+def compute_loss_per_sample_selected_attention(model, batch, device, ignored_token_ids, top_k=10):
+    if ignored_token_ids is not None and not isinstance(ignored_token_ids, torch.Tensor):
+        ignored_token_ids = torch.tensor(ignored_token_ids, device=device)
+    elif ignored_token_ids is not None:
+        ignored_token_ids = ignored_token_ids.to(device)
+
+    inputs = {k: v.to(device) for k, v in batch.items() if k in ["input_ids", "attention_mask", "labels"]}
+
+    with torch.no_grad():
+        outputs = model(
+            **inputs,
+            return_dict=True,
+            save_last_attention=True,
+            use_cache=False,
+        )
+    logits = outputs.logits  # keep bf16
+    attn = outputs.attentions[-1]
+    del outputs
+
+    bsz, n_heads, q_len, k_len = attn.shape
+    k = min(top_k, k_len)
+
+    topk_indices = torch.topk(attn, k=k, dim=-1, largest=True).indices
+    keep = torch.zeros_like(attn, dtype=torch.bool)
+    keep.scatter_(-1, topk_indices, True)
+
+    masked_raw_attn = attn * keep
+    token_weights = masked_raw_attn.sum(dim=-1).mean(dim=1)
+
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = inputs["labels"][..., 1:].contiguous().clone()
+
+    if ignored_token_ids is not None and len(ignored_token_ids) > 0:
+        mask_to_ignore = torch.isin(shift_labels, ignored_token_ids)
+        shift_labels[mask_to_ignore] = -100
+
+    loss_fct = nn.CrossEntropyLoss(reduction="none", ignore_index=-100)
+    token_losses = loss_fct(
+        shift_logits.view(-1, shift_logits.size(-1)),
+        shift_labels.view(-1),
+    ).view(shift_labels.size())
+
+    token_weights = token_weights[..., :-1].contiguous()
+    weighted_token_losses = token_losses * token_weights
+
+    valid_mask = shift_labels.ne(-100).float()
+    num_valid = valid_mask.sum(dim=1)
+
+    sum_loss = weighted_token_losses.sum(dim=1)
+    mean_loss = sum_loss / (num_valid + 1e-9)
+
+    return mean_loss, weighted_token_losses
+
+
+def compute_answer_only_weighted_loss(
+    model,
+    batch,
+    device,
+    target_idx,
+    top_k=10,
+    ignored_token_ids=None,
+    *,
+    enable_grad: bool = False,
+):
+    if ignored_token_ids is not None and not isinstance(ignored_token_ids, torch.Tensor):
+        ignored_token_ids = torch.tensor(ignored_token_ids, device=device)
+    elif ignored_token_ids is not None:
+        ignored_token_ids = ignored_token_ids.to(device)
+
+    inputs = {k: v.to(device) for k, v in batch.items() if k in ["input_ids", "attention_mask", "labels"]}
+    labels = inputs["labels"].clone()
+    start = int(target_idx[0].item())
+    labels[..., :start] = -100
+
+    with torch.set_grad_enabled(enable_grad):
+        outputs = model(
+            **inputs,
+            return_dict=True,
+            save_last_attention=True,
+            use_cache=False,
+        )
+    logits = outputs.logits
+    attn = outputs.attentions[-1].detach()  # crucial: avoid keeping attn graph
+    del outputs
+
+    bsz, n_heads, q_len, k_len = attn.shape
+    k = min(top_k, k_len)
+
+    topk_indices = torch.topk(attn, k=k, dim=-1, largest=True).indices
+    keep = torch.zeros_like(attn, dtype=torch.bool)
+    keep.scatter_(-1, topk_indices, True)
+
+    token_weights = (attn * keep).sum(dim=-1).mean(dim=1).detach()  # crucial: no grad here
+
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = labels[..., 1:].contiguous()
+
+    if ignored_token_ids is not None and len(ignored_token_ids) > 0:
+        shift_labels[torch.isin(shift_labels, ignored_token_ids)] = -100
+
+    loss_fct = nn.CrossEntropyLoss(reduction="none", ignore_index=-100)
+    token_losses = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+    token_losses = token_losses.view(shift_labels.size())
+
+    weighted_token_losses = token_losses * token_weights[..., :-1].contiguous()
+    valid = shift_labels.ne(-100).float()
+    mean_loss = weighted_token_losses.sum(dim=1) / (valid.sum(dim=1) + 1e-9)
+    return mean_loss, weighted_token_losses
 
 @torch.no_grad()
 def compute_loss_in_minibatches(model, collator, samples_list, ignored_token_ids, batch_size=2):
@@ -106,6 +217,51 @@ def compute_gradients(
         grads = torch.autograd.grad(loss, params, create_graph=False)
     return list(grads)
 
+
+def compute_gradients_selected_attention(
+    model,
+    batch,
+    param_filter_fn,
+    device,
+    ignored_token_ids,
+    *,
+    target_idx
+):
+    if torch.is_inference_mode_enabled():
+        raise RuntimeError("Disable torch.inference_mode() before calling this function.")
+
+    model.eval()
+    model.zero_grad(set_to_none=True)
+
+    params = [p for n, p in model.named_parameters()
+              if (param_filter_fn is None or param_filter_fn(n, p))]
+    if not params:
+        raise RuntimeError("No parameters selected by param_filter_fn.")
+
+    orig_flags = [p.requires_grad for p in params]
+    for p in params:
+        p.requires_grad_(True)
+
+    with torch.enable_grad():
+        mean_loss, _ = compute_answer_only_weighted_loss(
+            model,
+            batch,
+            device,
+            target_idx,
+            ignored_token_ids=ignored_token_ids,
+            enable_grad=True,
+        )
+        loss = mean_loss.mean()
+
+        if not loss.requires_grad:
+            raise RuntimeError("Loss is detached. Check outer contexts and model freezing.")
+
+        grads = torch.autograd.grad(loss, params, create_graph=False, allow_unused=False)
+
+    for p, flag in zip(params, orig_flags):
+        p.requires_grad_(flag)
+
+    return grads
 
 def compute_token_specific_update(
         model,

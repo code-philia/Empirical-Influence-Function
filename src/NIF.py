@@ -3,7 +3,8 @@ import json
 import os
 import torch
 from torch import nn
-from transformers import AutoModelForCausalLM, AutoTokenizer, DataCollatorForSeq2Seq, set_seed
+from transformers.modeling_outputs import CausalLMOutputWithPast
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, DataCollatorForSeq2Seq, Qwen2ForCausalLM, set_seed
 from accelerate import Accelerator
 
 from .process_data import CustomCollator, list_of_dicts_to_dict_of_lists as dataset_list_to_dict, process_func_chatml
@@ -16,8 +17,46 @@ from torch.utils.data import Dataset as TorchDataset
 from torch.nn import Parameter
 
 
+class Qwen2ForCausalLMWithLastAttn(Qwen2ForCausalLM):
+    def __init__(self, config):
+        super().__init__(config)
+        self.last_attention = None
+
+    def forward(self, *args, save_last_attention: bool = False, **kwargs):
+        self.last_attention = None
+        handle = None
+
+        if save_last_attention:
+            def _hook(_module, _inputs, output):
+                _, attn_weights = output
+                self.last_attention = attn_weights
+
+            # Hook only the last layer's attention
+            last_attn = self.model.layers[-1].self_attn
+            if not isinstance(last_attn, nn.Module):
+                raise TypeError("Expected `self_attn` to be an `nn.Module`.")
+            handle = last_attn.register_forward_hook(_hook)
+
+        try:
+            outputs = super().forward(*args, **kwargs)
+        finally:
+            if handle is not None:
+                handle.remove()
+
+        if not save_last_attention:
+            return outputs
+
+        return CausalLMOutputWithPast(
+            loss=outputs.loss,
+            logits=outputs.logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=(self.last_attention,) if self.last_attention is not None else None,
+        )
+
+
 # Unfreeze target layers
-target_layer_keywords = ["lm_head"]  # or ["model.layers.27.mlp"]
+target_layer_keywords = ["embed_tokens.weight"]  # or ["model.layers.27.mlp"]
 
 def unfreeze_params(model: torch.nn.Module):
     for name, param in model.named_parameters():
@@ -89,8 +128,16 @@ def load_model_and_tokenizer():
     print(f"Loading model from {abs_model_path}...")
 
     tokenizer = AutoTokenizer.from_pretrained(abs_model_path, local_files_only=True)
-    model = AutoModelForCausalLM.from_pretrained(
+    config = AutoConfig.from_pretrained(
         abs_model_path,
+        attn_implementation="eager",
+        output_attentions=False,
+        use_cache=False,
+    )
+
+    model = Qwen2ForCausalLMWithLastAttn.from_pretrained(
+        abs_model_path,
+        config=config,
         device_map="auto",
         torch_dtype=torch.bfloat16,
         local_files_only=True
@@ -99,6 +146,9 @@ def load_model_and_tokenizer():
     # Freeze all
     for param in model.parameters():
         param.requires_grad = False
+
+    # Unfreeze some
+    unfreeze_params(model)
 
     return model, tokenizer
 
@@ -136,13 +186,7 @@ class NewInferenceFunction:
             ignored_token_ids = []
         self.ignored_token_ids = torch.tensor(ignored_token_ids, device=self.device)
 
-        self.train_batches = []
         self.base_train_results = None
-
-        if self.train_loader is not None:
-            for batch in self.train_loader:
-                batch_cpu = {k: v.cpu() for k, v in batch.items() if isinstance(v, torch.Tensor)}
-                self.train_batches.append(batch_cpu)
 
     @staticmethod
     @torch.no_grad()
@@ -209,7 +253,7 @@ class NewInferenceFunction:
         return new_mask
 
     @torch.no_grad()
-    def masked_inference(self, batch, target_idx=None):
+    def masked_inference(self, batch, target_idx=None, gen_limit: int = 128):
         input_ids = batch["input_ids"].to(self.device)
         attention_mask = batch["attention_mask"].to(self.device)
 
@@ -225,23 +269,16 @@ class NewInferenceFunction:
             ]
             target_idx = torch.tensor(starts, device=input_ids.device)
 
-        attn_scores = self._get_last_layer_attn(input_ids, attention_mask, target_idx)
-        masked_attention = self._build_topk_mask(attention_mask, attn_scores, target_idx)
-
         outputs = self.model(
             input_ids=input_ids,
-            attention_mask=masked_attention,
+            attention_mask=attention_mask,
             return_dict=True,
         )
 
         logits = outputs.logits
         batch_size = logits.size(0)
 
-        prev_ids = []
-        prev_text = []
-        out_ids = []
-        out_text = []
-
+        prev_ids, prev_text, out_ids, out_text = [], [], [], []
         for i in range(batch_size):
             pos = int(target_idx[i].item()) - 1
             original_prev_ids = input_ids[i, :pos].tolist()
@@ -252,31 +289,75 @@ class NewInferenceFunction:
             out_ids.append(out_token_id)
             out_text.append(self.tokenizer.decode(out_token_id))
 
+        # Trim each sample to target_idx and pad to a common length for generation
+        trim_lens = target_idx.to(torch.long).tolist()
+        max_len = max(trim_lens)
+        trimmed_ids = input_ids.new_full((batch_size, max_len), self.tokenizer.eos_token_id)
+        trimmed_mask = attention_mask.new_zeros((batch_size, max_len))
+
+        for i, tlen in enumerate(trim_lens):
+            trimmed_ids[i, :tlen] = input_ids[i, :tlen]
+            trimmed_mask[i, :tlen] = 1
+
+        gen_ids = self.model.generate(
+            input_ids=trimmed_ids,
+            attention_mask=trimmed_mask,
+            max_new_tokens=gen_limit,
+            do_sample=False,
+            eos_token_id=self.tokenizer.eos_token_id,
+            pad_token_id=self.tokenizer.eos_token_id,
+        )
+
+        pred_ids, pred_text = [], []
+        full_text, answer_text = [], []
+
+        for i in range(batch_size):
+            prompt_len = int(target_idx[i].item())
+            continuation = gen_ids[i, prompt_len:].tolist()
+            pred_ids.append(continuation)
+            pred_text.append(self.tokenizer.decode(continuation))
+
+            valid_ids = input_ids[i, :int(attention_mask[i].sum().item())].tolist()
+            full_text.append(self.tokenizer.decode(valid_ids))
+
+            ans_ids = input_ids[i, prompt_len:int(attention_mask[i].sum().item())].tolist()
+            answer_text.append(self.tokenizer.decode(ans_ids))
+
         return {
+            **batch,
             "logits": logits,
-            "masked_attention": masked_attention,
+            "attention_mask": attention_mask,
             "target_idx": target_idx,
             "prev_ids": prev_ids,
             "prev_text": prev_text,
             "out_ids": out_ids,
             "out_text": out_text,
-        } 
-    
+            "gen_ids": gen_ids,
+            "pred_ids": pred_ids,
+            "pred_text": pred_text,
+            "full_text": full_text,
+            "answer_text": answer_text,
+        }
+
     def decode_next_token(self, logits, position):
         token_id = torch.argmax(logits[0, position], dim=-1).item()
         return self.tokenizer.decode(token_id)
 
     def _get_train_losses(self):
-        all_sum_losses = []
-        all_indices = []
+        all_sum_losses, all_indices = [], []
         tokenwise_dict = {}
-        self.model.eval()
 
-        with torch.no_grad():
-            for batch in self.train_batches:
+        self.model.eval()
+        with torch.inference_mode():
+            if not isinstance(self.train_loader, DataLoader):
+                raise TypeError("Expected `self.train_loader` to be an `DataLoader`.")
+            for batch in self.train_loader:
                 batch_gpu = {k: v.to(self.device) for k, v in batch.items()}
                 mean_loss, token_loss = compute_loss_per_sample(
-                    self.model, batch_gpu, self.device, self.ignored_token_ids
+                    self.model,
+                    batch_gpu,
+                    self.device,
+                    self.ignored_token_ids
                 )
 
                 shift_labels = batch_gpu["labels"][..., 1:].contiguous()
@@ -284,14 +365,13 @@ class NewInferenceFunction:
 
                 for i, idx in enumerate(indices):
                     valid_mask = shift_labels[i] != -100
-                    if valid_mask.any():
-                        start_idx = torch.where(valid_mask)[0][0]
-                        tokenwise_dict[idx] = token_loss[i][start_idx:].cpu()
-                    else:
-                        tokenwise_dict[idx] = torch.tensor([], device="cpu")
+                    start_idx = torch.where(valid_mask)[0][0] if valid_mask.any() else 0
+                    tokenwise_dict[idx] = token_loss[i][start_idx:].cpu()
 
-                all_sum_losses.append(mean_loss)
-                all_indices.append(batch_gpu["sample_index"])
+                all_sum_losses.append(mean_loss.detach().cpu())
+                all_indices.append(batch_gpu["sample_index"].detach().cpu())
+
+                del batch_gpu, mean_loss, token_loss, shift_labels  # crucial release
 
         return torch.cat(all_sum_losses), torch.cat(all_indices), tokenwise_dict
 
@@ -302,6 +382,7 @@ class NewInferenceFunction:
         max_steps=1000,
         loss_threshold=1e-4,
         top_k=10,
+        target_idx=None,
     ):
         if self.base_train_results is None:
             self.base_train_results = self._get_train_losses()
@@ -309,10 +390,18 @@ class NewInferenceFunction:
         self.model.eval()
         self.model.zero_grad(set_to_none=True)
 
-        # Compute labels range
-        shift_labels_q = query_batch["labels"][..., 1:].contiguous()
-        valid_q = shift_labels_q[0] != -100
-        start_q = torch.where(valid_q)[0][0] if valid_q.any() else 0
+        def _masked_query_batch(batch, target_idx_local):
+            masked = {k: v for k, v in batch.items()}
+            labels = batch["labels"].clone()
+            start = int(target_idx_local[0].item())
+            labels[..., :start] = -100
+            masked["labels"] = labels
+            return masked, start
+
+        if target_idx is None:
+            raise ValueError("target_idx is required to overfit generation starting from target_idx")
+
+        query_batch, start_q = _masked_query_batch(query_batch, target_idx)
 
         # Compute starting loss
         with torch.no_grad():
@@ -320,7 +409,6 @@ class NewInferenceFunction:
                 self.model, query_batch, self.device, self.ignored_token_ids, top_k=top_k
             )
             l_test_base = l_test_base_scalar.item()
-
             l_test_base_tokenwise = l_test_base_tokenwise_raw[0][start_q:].cpu()
 
         snapshot = self._get_param_snapshot(self.model, self.param_filter_fn)
@@ -331,14 +419,12 @@ class NewInferenceFunction:
             if curr_test_loss < loss_threshold:
                 break
 
-            # SGD
             grads = compute_gradients_selected_attention(
-                self.model, query_batch, self.param_filter_fn, self.device, self.ignored_token_ids
+                self.model, query_batch, self.param_filter_fn, self.device, self.ignored_token_ids, target_idx=target_idx
             )
             self._apply_gradient_update(self.model, grads, self.param_filter_fn, lr=lr)
             self.model.zero_grad(set_to_none=True)
 
-            # Compute loss again
             with torch.no_grad():
                 loss_s, _ = compute_loss_per_sample_selected_attention(
                     self.model, query_batch, self.device, self.ignored_token_ids, top_k=top_k
@@ -359,7 +445,7 @@ class NewInferenceFunction:
         # Train loss diff
         l_train_des_sum, _, l_train_des_tokenwise = self._get_train_losses()
         self._restore_params(self.model, snapshot, self.param_filter_fn)
-        l_train_base_sum, indices_local, l_train_base_tokenwise = self.base_train_results   # indices_local is train indices?
+        l_train_base_sum, indices_local, l_train_base_tokenwise = self.base_train_results
 
         # Compute scores
         local_scores = []
@@ -378,7 +464,6 @@ class NewInferenceFunction:
         all_indices = self.accelerator.gather(indices_local)
 
         return all_scores.tolist(), all_indices.tolist(), local_diffs, query_token_diffs
-
 
 class HFToTorchDataset(TorchDataset):
     def __init__(self, hf_dataset):
@@ -419,7 +504,7 @@ def main():
 
     train_loader = DataLoader(
         HFToTorchDataset(train_ds.select(range(100))),  # only check the first 100 training samples
-        batch_size=2,
+        batch_size=1,
         shuffle=False,
         collate_fn=collator
     )
@@ -439,7 +524,7 @@ def main():
     )
 
     # Build query batch
-    temp_ds = build_single_sample_query_batch(test_samples[0], convert_to_chatml_with_tokenizer)
+    temp_ds = build_single_sample_query_batch(test_samples[9], convert_to_chatml_with_tokenizer)    # choose a proper length sample, or it will cuda oom
     query_batch = base_collator([temp_ds[0]])
 
     for k, v in query_batch.items():
@@ -447,14 +532,16 @@ def main():
 
     # 1) Masked inference for one wrong sample
     result = infer.masked_inference(query_batch)
-    print(">>> Prev text:\n", result["prev_text"][0], sep="")
-    print(">>> Pred token:\n", result["out_text"][0], sep="")
+    print(">>> Prev text:\n", result["prev_text"][0].encode().decode('unicode_escape'), sep="")
+    print(">>> Answer text:\n", result["answer_text"][0].encode().decode('unicode_escape'), sep="")
+    print(">>> Pred text:\n", result["pred_text"][0].encode().decode('unicode_escape'), sep="")
 
     # 2) Empirical influence (overfit on one wrong sample)
     scores, indices, train_diffs, query_diffs = infer.influence_overfit_single(
         query_batch=query_batch,
         lr=5e-3,
-        max_steps=5,
+        max_steps=20,
+        target_idx=result["target_idx"]
     )
 
     print(scores)
