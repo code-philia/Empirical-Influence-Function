@@ -7,13 +7,13 @@ import torch
 from torch import nn
 from tqdm import tqdm
 from transformers.modeling_outputs import CausalLMOutputWithPast
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, DataCollatorForSeq2Seq, Qwen2ForCausalLM, set_seed
+from transformers import AutoConfig, AutoTokenizer, DataCollatorForSeq2Seq, Qwen2ForCausalLM, set_seed
 from accelerate import Accelerator
 
 from src.sft.inference import print_query_and_answer
 
 from .process_data import CustomCollator, list_of_dicts_to_dict_of_lists as dataset_list_to_dict, process_func_chatml
-from .loss import compute_gradients, compute_gradients_selected_attention, compute_loss_per_sample, compute_loss_per_sample_selected_attention
+from .loss import compute_answer_only_saliency_masked_loss, compute_gradients_selected_attention, compute_loss_per_sample
 
 from datasets import Dataset
 from torch.utils.data import DataLoader
@@ -280,6 +280,13 @@ class NewInferenceFunction:
             return_dict=True,
         )
 
+        _, _ , saliency_list = compute_answer_only_saliency_masked_loss(
+            self.model,
+            batch,
+            self.device,
+            target_idx
+        )
+
         logits = outputs.logits
         batch_size = logits.size(0)
 
@@ -315,17 +322,21 @@ class NewInferenceFunction:
 
         pred_ids, pred_text = [], []
         full_text, answer_text = [], []
+        pred_tokens, full_tokens, answer_tokens = [], [], []
 
         for i in range(batch_size):
             prompt_len = int(target_idx[i].item())
             continuation = gen_ids[i, prompt_len:].tolist()
             pred_ids.append(continuation)
+            pred_tokens.append(self.tokenizer.convert_ids_to_tokens(continuation))
             pred_text.append(self.tokenizer.decode(continuation))
 
             valid_ids = input_ids[i, :int(attention_mask[i].sum().item())].tolist()
+            full_tokens.append(self.tokenizer.convert_ids_to_tokens(valid_ids))
             full_text.append(self.tokenizer.decode(valid_ids))
 
             ans_ids = input_ids[i, prompt_len:int(attention_mask[i].sum().item())].tolist()
+            answer_tokens.append(self.tokenizer.convert_ids_to_tokens(ans_ids))
             answer_text.append(self.tokenizer.decode(ans_ids))
 
         return {
@@ -342,6 +353,10 @@ class NewInferenceFunction:
             "pred_text": pred_text,
             "full_text": full_text,
             "answer_text": answer_text,
+            "pred_tokens": pred_tokens,
+            "full_tokens": full_tokens,
+            "answer_tokens": answer_tokens,
+            "saliency": saliency_list
         }
 
     def decode_next_token(self, logits, position):
