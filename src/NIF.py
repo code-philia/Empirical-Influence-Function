@@ -1,13 +1,14 @@
+from collections.abc import Callable, Sequence, Mapping
 from functools import partial
 from heapq import nlargest
 import json
 import os
 from pprint import pprint
 import torch
-from torch import nn
+from torch import Tensor, nn
 from tqdm import tqdm
 from transformers.modeling_outputs import CausalLMOutputWithPast
-from transformers import AutoConfig, AutoTokenizer, DataCollatorForSeq2Seq, Qwen2ForCausalLM, set_seed
+from transformers import AutoConfig, AutoTokenizer, DataCollatorForSeq2Seq, GenerationMixin, PreTrainedTokenizer, Qwen2ForCausalLM, set_seed
 from accelerate import Accelerator
 
 from src.sft.inference import print_query_and_answer
@@ -20,6 +21,39 @@ from torch.utils.data import DataLoader
 from torch.utils.data import Dataset as TorchDataset
 
 from torch.nn import Parameter
+
+
+# dev-only patch, to see the shape of tensor when debugging
+def patch_torch_to_inspect_tensor_shape():
+    _orig_repr = torch.Tensor.__repr__
+
+    def _repr_with_shape(self: torch.Tensor, tensor_contents = None) -> str:
+        # 1) prepend shape/dtype/device
+        # 2) keep original tensor formatting
+        head = f"tensor(shape={tuple(self.shape)}, dtype={self.dtype}, device={self.device})\n"
+        return head + _orig_repr(self)
+
+    torch.Tensor.__repr__ = _repr_with_shape
+
+
+patch_torch_to_inspect_tensor_shape()
+
+
+# disable the "Map: ..." progress bar in Dataset
+from datasets.utils.logging import disable_progress_bar
+disable_progress_bar()
+
+
+def round_floats(obj, ndigits: int):
+    # 1) recursively walk containers
+    # 2) round floats only
+    if isinstance(obj, float):
+        return round(obj, ndigits)
+    if isinstance(obj, Mapping):
+        return {k: round_floats(v, ndigits) for k, v in obj.items()}
+    if isinstance(obj, Sequence) and not isinstance(obj, (str, bytes, bytearray)):
+        return [round_floats(v, ndigits) for v in obj]
+    return obj
 
 
 class Qwen2ForCausalLMWithLastAttn(Qwen2ForCausalLM):
@@ -169,51 +203,71 @@ def _find_subseq_start(row: torch.Tensor, subseq: tuple[int, int, int]) -> int:
 class NewInferenceFunction:
     def __init__(
         self,
-        model,
-        tokenizer,
-        train_loader=None,
-        accelerator=None,
-        param_filter_fn=None,
-        ignored_token_ids=None,
-        top_k=None,
-        top_k_ratio=0.2,
-    ):
+        model: nn.Module,
+        tokenizer: PreTrainedTokenizer,
+        train_loader: DataLoader | None = None,
+        accelerator: Accelerator | None = None,
+        param_filter_fn: Callable[[str, Parameter], bool] | None = None,
+        ignored_token_ids: Sequence[int] | None = None,
+        top_k: int = 10,
+        top_k_ratio: float = 0.2,
+    ) -> None:
         self.model = model
         self.tokenizer = tokenizer
         self.train_loader = train_loader
         self.accelerator = accelerator
+
+        # Resolve device once to avoid repeated attribute checks
+        self.device = (
+            accelerator.device if accelerator is not None else next(model.parameters()).device
+        )
+
+        # Configure filtering and selection parameters
         self.param_filter_fn = param_filter_fn
-        self.device = accelerator.device if accelerator is not None else next(model.parameters()).device
         self.top_k = top_k
         self.top_k_ratio = top_k_ratio
 
-        if ignored_token_ids is None:
-            ignored_token_ids = []
+        # Normalize ignored IDs to a device-local tensor
+        ignored_token_ids = ignored_token_ids or []
         self.ignored_token_ids = torch.tensor(ignored_token_ids, device=self.device)
 
-        self.base_train_results = None
+        self.base_train_results: tuple | None = None
+        self.param_filter_fn: Callable[[str, Parameter], bool] | None = None
+        self.param_snapshot_original: list[Parameter] | None = None
+        self.param_snapshot_overfit: list[Parameter] | None = None
 
-    @staticmethod
     @torch.no_grad()
-    def _get_param_snapshot(model, param_filter_fn):
+    def _save_model_params(self):
+        model = self.model
+        param_filter_fn = self.param_filter_fn
+
         snapshot = []
         for name, param in model.named_parameters():
             if param.requires_grad and (param_filter_fn is None or param_filter_fn(name, param)):
                 snapshot.append(param.detach().cpu().clone())
         return snapshot
 
-    @staticmethod
     @torch.no_grad()
-    def _restore_params(model, snapshot, param_filter_fn):
+    def _restore_model_params(self, param_snapshot: list[Parameter] | None = None):
+        model = self.model
+        param_filter_fn = self.param_filter_fn
+
+        if param_snapshot is None:
+            param_snapshot = self.param_snapshot_original
+        if param_snapshot is None:
+            return
+
         idx = 0
         for name, param in model.named_parameters():
             if param.requires_grad and (param_filter_fn is None or param_filter_fn(name, param)):
-                param.data.copy_(snapshot[idx].to(param.device))
+                param.data.copy_(param_snapshot[idx].to(param.device))
                 idx += 1
 
-    @staticmethod
     @torch.no_grad()
-    def _apply_gradient_update(model, grads, param_filter_fn, lr):
+    def _apply_gradient_update(self, grads, lr):
+        model = self.model
+        param_filter_fn = self.param_filter_fn
+
         idx = 0
         for name, param in model.named_parameters():
             if param.requires_grad and (param_filter_fn is None or param_filter_fn(name, param)):
@@ -221,23 +275,6 @@ class NewInferenceFunction:
                     grad_device = grads[idx].to(param.device).to(param.dtype)
                     param.data -= lr * grad_device
                 idx += 1
-
-    @torch.no_grad()
-    def _get_last_layer_attn(self, input_ids, attention_mask, target_idx):
-        self.model.eval()
-        self.model.set_attn_implementation("eager")
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            output_attentions=True,
-            return_dict=True,
-        )
-        self.model.set_attn_implementation("sdpa")
-
-        last_layer_attn = outputs.attentions[-1]
-        predicting_idx = target_idx - 1
-        attn = last_layer_attn[0, :, predicting_idx, :target_idx]
-        return attn.mean(0).detach().cpu()
 
     def _build_topk_mask(self, base_attention_mask, attn_scores, target_idx):
         new_mask = base_attention_mask.clone()
@@ -262,6 +299,7 @@ class NewInferenceFunction:
         input_ids = batch["input_ids"].to(self.device)
         attention_mask = batch["attention_mask"].to(self.device)
 
+        # find target index
         if target_idx is None:
             marker_ids = tuple(
                 self.tokenizer.encode("<|im_start|>assistant\n", add_special_tokens=False)
@@ -273,14 +311,17 @@ class NewInferenceFunction:
                 for i in range(input_ids.size(0))
             ]
             target_idx = torch.tensor(starts, device=input_ids.device)
+        elif not isinstance(target_idx, Tensor):
+            target_idx = torch.tensor(target_idx, device=input_ids.device)
 
+        # single token inference
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             return_dict=True,
         )
 
-        _, _ , saliency_list = compute_answer_only_saliency_masked_loss(
+        _, _, saliency_original = compute_answer_only_saliency_masked_loss(
             self.model,
             batch,
             self.device,
@@ -294,7 +335,7 @@ class NewInferenceFunction:
         for i in range(batch_size):
             pos = int(target_idx[i].item()) - 1
             original_prev_ids = input_ids[i, :pos].tolist()
-            out_token_id = torch.argmax(logits[i, pos], dim=-1).item()
+            out_token_id = int(torch.argmax(logits[i, pos], dim=-1).item())
 
             prev_ids.append(original_prev_ids)
             prev_text.append(self.tokenizer.decode(original_prev_ids))
@@ -311,25 +352,61 @@ class NewInferenceFunction:
             trimmed_ids[i, :tlen] = input_ids[i, :tlen]
             trimmed_mask[i, :tlen] = 1
 
+        if not isinstance(self.model, GenerationMixin):
+            raise ValueError("Expect self.model to be GenerationMixin")
+
+        # generation sequence inference
         gen_ids = self.model.generate(
             input_ids=trimmed_ids,
             attention_mask=trimmed_mask,
             max_new_tokens=gen_limit,
             do_sample=False,
             eos_token_id=[self.tokenizer.eos_token_id, self.tokenizer.pad_token_id],
-            pad_token_id=self.tokenizer.pad_token_id
+            pad_token_id=self.tokenizer.pad_token_id,
+            return_dict_in_generate=False
         )
 
-        pred_ids, pred_text = [], []
+        if not isinstance(gen_ids, Tensor):
+            raise ValueError("Expect gen_ids to be Tensor")
+        if not isinstance(self.tokenizer.pad_token_id, int):
+            raise ValueError("Expect pad_token_id to be int")
+
+        # build generation batch and compute saliency on generated continuation
+        gen_attention_mask = gen_ids.ne(int(self.tokenizer.pad_token_id)).to(dtype=attention_mask.dtype)
+        gen_labels = gen_ids.clone()
+
+        # mask prompt and padding positions for loss
+        for i, t in enumerate(target_idx.tolist()):
+            gen_labels[i, :t] = -100
+        gen_labels = gen_labels.masked_fill(gen_attention_mask == 0, -100)
+
+        gen_batch = {
+            **batch,
+            "input_ids": gen_ids,
+            "attention_mask": gen_attention_mask,
+            "labels": gen_labels,
+        }
+        _, _, saliency_generation = compute_answer_only_saliency_masked_loss(
+            self.model,
+            gen_batch,
+            self.device,
+            target_idx
+        )
+        pred_ids, pred_text, pred_full_text = [], [], []
         full_text, answer_text = [], []
-        pred_tokens, full_tokens, answer_tokens = [], [], []
+        pred_tokens, pred_full_tokens, full_tokens, answer_tokens = [], [], [], []
 
         for i in range(batch_size):
             prompt_len = int(target_idx[i].item())
             continuation = gen_ids[i, prompt_len:].tolist()
+            full_gen_ids = gen_ids[i].tolist()
+
             pred_ids.append(continuation)
             pred_tokens.append(self.tokenizer.convert_ids_to_tokens(continuation))
             pred_text.append(self.tokenizer.decode(continuation))
+
+            pred_full_tokens.append(self.tokenizer.convert_ids_to_tokens(full_gen_ids))
+            pred_full_text.append(self.tokenizer.decode(full_gen_ids))
 
             valid_ids = input_ids[i, :int(attention_mask[i].sum().item())].tolist()
             full_tokens.append(self.tokenizer.convert_ids_to_tokens(valid_ids))
@@ -343,7 +420,7 @@ class NewInferenceFunction:
             **batch,
             "logits": logits,
             "attention_mask": attention_mask,
-            "target_idx": target_idx,
+            "target_idx": target_idx.tolist(),
             "prev_ids": prev_ids,
             "prev_text": prev_text,
             "out_ids": out_ids,
@@ -351,16 +428,19 @@ class NewInferenceFunction:
             "gen_ids": gen_ids,
             "pred_ids": pred_ids,
             "pred_text": pred_text,
+            "pred_full_text": pred_full_text,
             "full_text": full_text,
             "answer_text": answer_text,
             "pred_tokens": pred_tokens,
+            "pred_full_tokens": pred_full_tokens,
             "full_tokens": full_tokens,
             "answer_tokens": answer_tokens,
-            "saliency": saliency_list
+            "saliency_original": saliency_original,
+            "saliency_generation": saliency_generation
         }
-
+    
     def decode_next_token(self, logits, position):
-        token_id = torch.argmax(logits[0, position], dim=-1).item()
+        token_id = int(torch.argmax(logits[0, position], dim=-1).item())
         return self.tokenizer.decode(token_id)
 
     def _get_train_losses(self):
@@ -417,7 +497,7 @@ class NewInferenceFunction:
         def _masked_query_batch(batch, target_idx_local):
             masked = {k: v for k, v in batch.items()}
             labels = batch["labels"].clone()
-            start = int(target_idx_local[0].item())
+            start = int(target_idx_local[0])
             labels[..., :start] = -100
             masked["labels"] = labels
             return masked, start
@@ -433,66 +513,78 @@ class NewInferenceFunction:
                 self.model, query_batch, self.device, self.ignored_token_ids
             )
             loss_test_start = scalar.item()
-            loss_test_start_tokenwise = tokenwise_raw[0][start_q:].cpu()
+            loss_test_tokenwise_start = tokenwise_raw[0][start_q:].cpu()
 
-        snapshot = self._get_param_snapshot(self.model, self.param_filter_fn)
+        self.param_snapshot_original = self._save_model_params()
 
         # Overfitting
-        curr_test_loss = loss_test_start
+        loss_test_curr = loss_test_start
         pbar = tqdm(range(max_steps), desc=f"Overfitting on single sample", leave=False)
         for step in pbar:
-            pbar.set_postfix(loss=f"{curr_test_loss:.4f}")
+            pbar.set_postfix(loss=f"{loss_test_curr:.4f}")
 
-            if curr_test_loss < loss_threshold:
+            if loss_test_curr < loss_threshold:
                 break
 
-            grads = compute_gradients_selected_attention(
-                self.model, query_batch, self.param_filter_fn, self.device, self.ignored_token_ids, target_idx=target_idx
+            grads, saliency = compute_gradients_selected_attention(
+                self.model, query_batch, self.param_filter_fn, self.device, self.ignored_token_ids, target_idx=torch.Tensor(target_idx)
             )
-            self._apply_gradient_update(self.model, grads, self.param_filter_fn, lr=lr)
+            self._apply_gradient_update(grads, lr=lr)
             self.model.zero_grad(set_to_none=True)
 
             with torch.no_grad():
                 scalar, _ = compute_loss_per_sample(
                     self.model, query_batch, self.device, self.ignored_token_ids
                 )
-                curr_test_loss = scalar.item()
+                loss_test_curr = scalar.item()
 
         # Compute ending loss
         with torch.no_grad():
             _, l_test_des_tokenwise_raw = compute_loss_per_sample(
                 self.model, query_batch, self.device, self.ignored_token_ids
             )
-            loss_test_end_tokenwise = l_test_des_tokenwise_raw[0][start_q:].cpu()
+            loss_test_tokenwise_end = l_test_des_tokenwise_raw[0][start_q:].cpu()
 
         # Test loss diff
-        query_token_diffs = loss_test_end_tokenwise - loss_test_start_tokenwise
-        delta_test = curr_test_loss - loss_test_start
+        query_token_diffs = loss_test_tokenwise_end - loss_test_tokenwise_start
+        delta_test = loss_test_curr - loss_test_start
 
         # Train loss diff
-        l_train_des_sum, _, l_train_des_tokenwise = self._get_train_losses()
-        self._restore_params(self.model, snapshot, self.param_filter_fn)
-        l_train_base_sum, indices_local, l_train_base_tokenwise = self.base_train_results
+        loss_train_des_sum, _, loss_train_des_tokenwise = self._get_train_losses()
+        loss_train_base_sum, indices_train, loss_train_base_tokenwise = self.base_train_results
 
         # Compute scores
         local_scores = []
         local_diffs = {}
-        for i, idx in enumerate(indices_local.tolist()):
-            rel_delta_train = l_train_des_sum[i].item() - l_train_base_sum[i].item()
-            denom = l_train_base_sum[i].item() + 1e-8
+        for i, idx in enumerate(indices_train.tolist()):
+            rel_delta_train = loss_train_des_sum[i].item() - loss_train_base_sum[i].item()
+            denom = loss_train_base_sum[i].item() + 1e-8
             normalized_score = delta_test * (rel_delta_train / denom)
             local_scores.append(normalized_score)
-            local_diffs[idx] = l_train_des_tokenwise[idx] - l_train_base_tokenwise[idx]
+            local_diffs[idx] = loss_train_des_tokenwise[idx] - loss_train_base_tokenwise[idx]
 
         if self.accelerator is None:
-            return local_scores, indices_local.tolist(), local_diffs, query_token_diffs
+            return local_scores, indices_train.tolist(), local_diffs, query_token_diffs
 
         all_scores = self.accelerator.gather(torch.tensor(local_scores, device=self.device))
-        all_indices = self.accelerator.gather(indices_local)
+        all_indices = self.accelerator.gather(indices_train)
+
+        self.param_snapshot_overfit = self._save_model_params()
+        self._restore_model_params(self.param_snapshot_original)
+
+        if not isinstance(all_scores, Tensor):
+            raise ValueError("Expect all_scores to be Tensor")
+        
+        if not isinstance(all_indices, Tensor):
+            raise ValueError("Expect all_indices to be Tensor")
 
         return all_scores.tolist(), all_indices.tolist(), local_diffs, query_token_diffs
 
-class HFToTorchDataset(TorchDataset):
+class DatasetWrapper(TorchDataset):
+    '''
+    A dataset wrapper converting HuggingFace `Dataset` to Torch `Dataset`.
+    '''
+
     def __init__(self, hf_dataset):
         self._ds = hf_dataset
 
@@ -530,7 +622,7 @@ def main():
     collator = CustomCollator(base_collator)
 
     train_loader = DataLoader(
-        HFToTorchDataset(train_ds.select(range(100))),  # only check the first 100 training samples
+        DatasetWrapper(train_ds.select(range(100))),  # only check the first 100 training samples
         batch_size=1,
         shuffle=False,
         collate_fn=collator
@@ -551,7 +643,7 @@ def main():
     )
 
     # Build query batch
-    temp_ds = build_single_sample_query_batch(test_samples[9], convert_to_chatml_with_tokenizer)    # choose a proper length sample, or it will cuda oom
+    temp_ds = build_single_sample_query_batch(test_samples[18], convert_to_chatml_with_tokenizer)    # choose a proper length sample, or it will cuda oom
     query_batch = base_collator([temp_ds[0]])
 
     for k, v in query_batch.items():
@@ -562,7 +654,7 @@ def main():
     print_query_and_answer(result["prev_text"][0], result["answer_text"][0], result["pred_text"][0])
 
     # 2) Rebuild query batch using prediction as new ground truth
-    prompt_len = int(result["target_idx"][0].item())
+    prompt_len = int(result["target_idx"][0])
     prompt_ids = query_batch["input_ids"][0, :prompt_len]
     pred_ids = torch.tensor(
         result["pred_ids"][0],
@@ -584,15 +676,42 @@ def main():
     scores, indices, train_diffs, query_diffs = infer.influence_overfit_single(
         query_batch=query_batch,
         lr=5e-3,
-        max_steps=50,
+        max_steps=10,
         target_idx=result["target_idx"]
     )
 
-    result = nlargest(10, enumerate(scores), key=lambda x: x[1])
-    pprint(result)
+    # select 20 largest then filter out short ones, we cannot compute token level saliency for too long trainging samples
+    most_related_samples = nlargest(20, enumerate(scores), key=lambda x: x[1])
+    pprint(most_related_samples)
+    saliency_analysis_samples = []
+    for idx, score in most_related_samples:
+        if train_ds["input_ids"][idx].shape[0] <= 2000:
+            saliency_analysis_samples.append((idx, score))
+    saliency_analysis_samples = saliency_analysis_samples[:10]
 
-    print(">>> Top-10 related training samples\n")
-    for i, sim in result:
+    # run inference and dump all results
+    dumped_json = {
+        "related_train_samples": [],
+        "target_test_sample": {}
+    }
+    dumped_json["target_test_sample"]["before"] = {
+        "full_tokens": result["full_tokens"][0],
+        "start_index": result["target_idx"][0],
+        "saliency_list": result["saliency_original"][0]
+    }
+
+    infer._restore_model_params(infer.param_snapshot_overfit)
+
+    result = infer.masked_inference(query_batch)
+    dumped_json["target_test_sample"]["after"] = {
+        "full_tokens": result["full_tokens"][0],
+        "start_index": result["target_idx"][0],
+        "saliency_list": result["saliency_original"][0]
+    }
+
+    infer._restore_model_params(infer.param_snapshot_original)
+
+    for i, sim in tqdm(saliency_analysis_samples, desc='Analyzing training sample saliency'):
         # Build query batch
         temp_ds = build_single_sample_query_batch(train_samples[i], convert_to_chatml_with_tokenizer)    # choose a proper length sample, or it will cuda oom
         query_batch = base_collator([temp_ds[0]])
@@ -600,9 +719,43 @@ def main():
         for k, v in query_batch.items():
             query_batch[k] = v.to(accelerator.device)
 
-        result = infer.masked_inference(query_batch)
-        print_query_and_answer(result["prev_text"][0], result["answer_text"][0], result["pred_text"][0])
+        result_0 = infer.masked_inference(query_batch)
 
+        infer._restore_model_params(infer.param_snapshot_overfit)
+
+        result_1 = infer.masked_inference(query_batch)
+
+        infer._restore_model_params(infer.param_snapshot_original)
+
+        dumped_json["related_train_samples"].append({
+            "target_idx": result_0["target_idx"][0],
+            "before_original": {
+                "full_tokens": result_0["full_tokens"][0],
+                "start_index": result_0["target_idx"][0],
+                "saliency_list": result_0["saliency_original"][0]
+            },
+            "before_generation": {
+                "full_tokens": result_0["pred_full_tokens"][0],
+                "start_index": result_0["target_idx"][0],
+                "saliency_list": result_0["saliency_generation"][0]
+            },
+            "after_original": {
+                "full_tokens": result_1["full_tokens"][0],
+                "start_index": result_1["target_idx"][0],
+                "saliency_list": result_1["saliency_original"][0]
+            },
+            "after_generation": {
+                "full_tokens": result_1["pred_full_tokens"][0],
+                "start_index": result_1["target_idx"][0],
+                "saliency_list": result_1["saliency_generation"][0]
+            }
+        })
+    
+    # compress json size
+    dumped_json = round_floats(dumped_json, 5)
+
+    with open('./latest_saliency.json', 'w', encoding = 'utf-8') as f:
+        json.dump(dumped_json ,f)
 
 
 if __name__ == "__main__":

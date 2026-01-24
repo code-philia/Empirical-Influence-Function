@@ -1,25 +1,5 @@
 import torch
 import torch.nn as nn
-import random
-import torch
-import logging
-from typing import List, Dict, Callable, Optional, Any
-from torch import nn
-from torch.utils.data import DataLoader
-from transformers import AutoModelForCausalLM, AutoTokenizer, DataCollatorForSeq2Seq, Qwen2ForCausalLM
-from datasets import Dataset
-from functools import partial
-import json
-from tqdm import tqdm
-import re
-import os
-import numpy as np
-import re
-import shutil
-import re
-import torch
-import random
-from typing import Optional, Dict, List
 
 def compute_loss_per_sample(model, batch, device, ignored_token_ids):
     """
@@ -173,6 +153,8 @@ def compute_answer_only_saliency_masked_loss(
     token_weights = torch.zeros((bsz, q_len), device=device, dtype=attn.dtype)
 
     saliency_list = []
+    for i in range(bsz):
+        saliency_list.append([])
 
     for t in range(max(start, 1), q_len):
         curr_input_ids = inputs["input_ids"][:, :t]
@@ -198,10 +180,11 @@ def compute_answer_only_saliency_masked_loss(
         masked_attn = attn[:, :, t - 1, :] * mask[:, None, :]
         token_weights[:, t - 1] = masked_attn.sum(dim=-1).mean(dim=1).detach()
 
-        saliency_list.append({
-            "index": t,
-            "saliency": saliency
-        })
+        for i in range(bsz):
+            saliency_list[i].append({
+                "index": t,
+                "saliency": saliency[i].tolist()
+            })
         del embeddings, grads, step_outputs
 
     shift_logits = logits[..., :-1, :].contiguous()
