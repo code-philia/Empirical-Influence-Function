@@ -14,7 +14,7 @@ from accelerate import Accelerator
 from src.sft.inference import print_query_and_answer
 
 from .process_data import CustomCollator, list_of_dicts_to_dict_of_lists as dataset_list_to_dict, process_func_chatml
-from .loss import compute_answer_only_saliency_masked_loss, compute_gradients_selected_attention, compute_loss_per_sample
+from .loss import compute_answer_only_saliency_masked_loss, compute_gradients, compute_gradients_selected_attention, compute_loss_per_sample
 
 from datasets import Dataset
 from torch.utils.data import DataLoader
@@ -248,7 +248,7 @@ class NewInferenceFunction:
         return snapshot
 
     @torch.no_grad()
-    def _restore_model_params(self, param_snapshot: list[Parameter] | None = None):
+    def restore_model_params(self, param_snapshot: list[Parameter] | None = None):
         model = self.model
         param_filter_fn = self.param_filter_fn
 
@@ -314,7 +314,8 @@ class NewInferenceFunction:
         elif not isinstance(target_idx, Tensor):
             target_idx = torch.tensor(target_idx, device=input_ids.device)
 
-        # single token inference
+        # Part 1: single token inference
+
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -355,7 +356,8 @@ class NewInferenceFunction:
         if not isinstance(self.model, GenerationMixin):
             raise ValueError("Expect self.model to be GenerationMixin")
 
-        # generation sequence inference
+        # Part 2: generation sequence inference
+
         gen_ids = self.model.generate(
             input_ids=trimmed_ids,
             attention_mask=trimmed_mask,
@@ -553,14 +555,17 @@ class NewInferenceFunction:
         loss_train_des_sum, _, loss_train_des_tokenwise = self._get_train_losses()
         loss_train_base_sum, indices_train, loss_train_base_tokenwise = self.base_train_results
 
-        # Compute scores
+        # Compute similarity scores
         local_scores = []
         local_diffs = {}
         for i, idx in enumerate(indices_train.tolist()):
             rel_delta_train = loss_train_des_sum[i].item() - loss_train_base_sum[i].item()
+            # average over all train samples
             denom = loss_train_base_sum[i].item() + 1e-8
+            # cosine similarity
             normalized_score = delta_test * (rel_delta_train / denom)
             local_scores.append(normalized_score)
+            # optional, record token-level loss changes
             local_diffs[idx] = loss_train_des_tokenwise[idx] - loss_train_base_tokenwise[idx]
 
         if self.accelerator is None:
@@ -570,7 +575,7 @@ class NewInferenceFunction:
         all_indices = self.accelerator.gather(indices_train)
 
         self.param_snapshot_overfit = self._save_model_params()
-        self._restore_model_params(self.param_snapshot_original)
+        self.restore_model_params(self.param_snapshot_original)
 
         if not isinstance(all_scores, Tensor):
             raise ValueError("Expect all_scores to be Tensor")
@@ -579,12 +584,112 @@ class NewInferenceFunction:
             raise ValueError("Expect all_indices to be Tensor")
 
         return all_scores.tolist(), all_indices.tolist(), local_diffs, query_token_diffs
+    
+    def _mask_labels_before_target(
+        self,
+        batch: Mapping[str, Tensor],
+        target_idx: int | Sequence[int] | Tensor,
+    ) -> tuple[dict[str, Tensor], Tensor]:
+        if "labels" not in batch:
+            raise KeyError("batch must contain `labels`.")
+        labels = batch["labels"].clone()  # labels: [B, T]
+        if not isinstance(target_idx, Tensor):
+            target_idx = torch.tensor(target_idx, device=labels.device)
+        target_idx = target_idx.to(device=labels.device)
+
+        if target_idx.ndim == 0:
+            target_idx = target_idx[None]
+        if labels.size(0) != target_idx.numel():
+            raise ValueError("target_idx size must match batch size.")
+
+        for i, start in enumerate(target_idx.tolist()):
+            labels[i, :int(start)] = -100
+        masked = dict(batch)
+        masked["labels"] = labels
+        return masked, target_idx
+
+    def _flatten_grads(
+        self,
+        grads: Sequence[Tensor],
+        *,
+        dtype: torch.dtype = torch.float32,
+    ) -> Tensor:
+        # flatten each param grad to 1D then concatenate -> [P]
+        flat = [g.detach().reshape(-1).to(dtype=dtype) for g in grads if g is not None]
+        if not flat:
+            raise RuntimeError("No gradients to flatten.")
+        return torch.cat(flat, dim=0)
+
+    def influence_gradient_single(
+        self,
+        query_batch: Mapping[str, Tensor],
+        target_idx: int | Sequence[int] | Tensor,
+    ):
+        if not isinstance(self.train_loader, DataLoader):
+            raise TypeError("Expected `self.train_loader` to be a DataLoader.")
+        if target_idx is None:
+            raise ValueError("target_idx is required.")
+
+        self.model.eval()
+        query_batch = {k: v.to(self.device) for k, v in query_batch.items() if isinstance(v, Tensor)}
+        query_batch, _ = self._mask_labels_before_target(query_batch, target_idx)
+
+        # query_vec: [P] flattened gradient over selected params
+        query_grads = compute_gradients(
+            self.model, query_batch, self.param_filter_fn, self.device, self.ignored_token_ids
+        )
+        query_vec = self._flatten_grads(query_grads, dtype=torch.float32)
+        query_norm = query_vec.norm().clamp_min(1e-12)
+
+        local_scores, local_indices = [], []
+        pbar = tqdm(self.train_loader, desc="Gradient influence", leave=False)
+        
+        # sample level 
+        for batch in pbar:
+            batch_gpu = {k: v.to(self.device) for k, v in batch.items() if isinstance(v, Tensor)}
+            indices = batch_gpu.get("sample_index")
+            bsz = batch_gpu["input_ids"].size(0)
+
+            for i in range(bsz):
+                single = {
+                    "input_ids": batch_gpu["input_ids"][i:i + 1],
+                    "attention_mask": batch_gpu["attention_mask"][i:i + 1],
+                    "labels": batch_gpu["labels"][i:i + 1],
+                }
+
+                # train_vec: [P] flattened gradient for one train sample
+                train_grads = compute_gradients(
+                    self.model, single, self.param_filter_fn, self.device, self.ignored_token_ids
+                )
+                train_vec = self._flatten_grads(train_grads, dtype=torch.float32)
+                train_norm = train_vec.norm().clamp_min(1e-12)
+
+                sim = torch.dot(query_vec, train_vec) / (query_norm * train_norm)
+                local_scores.append(float(sim.detach().cpu()))
+                if indices is not None:
+                    local_indices.append(int(indices[i].item()))
+
+            del batch_gpu  # crucial release
+
+        if self.accelerator is None:
+            return local_scores, local_indices
+
+        scores_t = torch.tensor(local_scores, device=self.device, dtype=torch.float32)
+        indices_t = torch.tensor(local_indices, device=self.device, dtype=torch.long)
+        all_scores = self.accelerator.gather(scores_t)
+        all_indices = self.accelerator.gather(indices_t)
+
+        if not isinstance(all_scores, Tensor):
+            raise ValueError("Expect all_scores to be Tensor")
+        if not isinstance(all_indices, Tensor):
+            raise ValueError("Expect all_indices to be Tensor")
+
+        return all_scores.tolist(), all_indices.tolist()
 
 class DatasetWrapper(TorchDataset):
     '''
     A dataset wrapper converting HuggingFace `Dataset` to Torch `Dataset`.
     '''
-
     def __init__(self, hf_dataset):
         self._ds = hf_dataset
 
@@ -595,7 +700,7 @@ class DatasetWrapper(TorchDataset):
         return self._ds[idx]
 
 
-def main():
+def main_compute_new_inference_function():
 
     accelerator = Accelerator()
     set_seed(42)
@@ -615,7 +720,8 @@ def main():
         tokenizer=tokenizer,
         model=model,
         padding=True,
-        label_pad_token_id=-100
+        label_pad_token_id=-100,
+        return_tensors="pt"
     )
 
     # Extracts sample index to the batch property
@@ -700,7 +806,7 @@ def main():
         "saliency_list": result["saliency_original"][0]
     }
 
-    infer._restore_model_params(infer.param_snapshot_overfit)
+    infer.restore_model_params(infer.param_snapshot_overfit)
 
     result = infer.masked_inference(query_batch)
     dumped_json["target_test_sample"]["after"] = {
@@ -709,7 +815,7 @@ def main():
         "saliency_list": result["saliency_original"][0]
     }
 
-    infer._restore_model_params(infer.param_snapshot_original)
+    infer.restore_model_params(infer.param_snapshot_original)
 
     for i, sim in tqdm(saliency_analysis_samples, desc='Analyzing training sample saliency'):
         # Build query batch
@@ -721,11 +827,11 @@ def main():
 
         result_0 = infer.masked_inference(query_batch)
 
-        infer._restore_model_params(infer.param_snapshot_overfit)
+        infer.restore_model_params(infer.param_snapshot_overfit)
 
         result_1 = infer.masked_inference(query_batch)
 
-        infer._restore_model_params(infer.param_snapshot_original)
+        infer.restore_model_params(infer.param_snapshot_original)
 
         dumped_json["related_train_samples"].append({
             "target_idx": result_0["target_idx"][0],
@@ -758,5 +864,153 @@ def main():
         json.dump(dumped_json ,f)
 
 
+def main_compute_gradient_related_samples():
+    # Part 1: the preparation remain the same
+    
+    accelerator = Accelerator()
+    set_seed(42)
+
+    model, tokenizer = load_model_and_tokenizer()
+
+    convert_to_chatml_with_tokenizer = partial(process_func_chatml, tokenizer=tokenizer)
+
+    # Load Data
+    train_samples = load_samples_from_formal_jsonl("sft_train.jsonl")
+
+    test_samples = load_samples_from_formal_jsonl("sft_test.jsonl")
+
+    train_ds = build_train_dataset(train_samples, convert_to_chatml_with_tokenizer)
+    train_ds = train_ds.filter(lambda x: len(x["input_ids"]) <= 2000)
+
+    base_collator = DataCollatorForSeq2Seq(
+        tokenizer=tokenizer,
+        model=model,
+        padding=True,
+        label_pad_token_id=-100
+    )
+
+    # Extracts sample index to the batch property
+    collator = CustomCollator(base_collator)
+
+    train_loader = DataLoader(
+        DatasetWrapper(train_ds.select(range(100))),  # only check the first 100 training samples
+        batch_size=1,
+        shuffle=False,
+        collate_fn=collator
+    )
+
+    train_loader = accelerator.prepare(train_loader)
+
+    # Assume: model, tokenizer already loaded
+    # Assume: query_batch already built with input_ids and attention_mask
+
+    infer = NewInferenceFunction(
+        model=model,
+        tokenizer=tokenizer,
+        train_loader=train_loader,
+        accelerator=accelerator,
+        param_filter_fn=filter_params,
+        top_k=20,
+    )
+
+    # Build query batch
+    temp_ds = build_single_sample_query_batch(test_samples[18], convert_to_chatml_with_tokenizer)    # choose a proper length sample, or it will cuda oom
+    query_batch = base_collator([temp_ds[0]])
+
+    for k, v in query_batch.items():
+        query_batch[k] = v.to(accelerator.device)
+
+    # 1) Masked inference for one wrong sample
+    result = infer.masked_inference(query_batch)
+    print_query_and_answer(result["prev_text"][0], result["answer_text"][0], result["pred_text"][0])
+
+    # 2) Rebuild query batch using prediction as new ground truth
+    prompt_len = int(result["target_idx"][0])
+    prompt_ids = query_batch["input_ids"][0, :prompt_len]
+    pred_ids = torch.tensor(
+        result["pred_ids"][0],
+        device=prompt_ids.device,
+        dtype=prompt_ids.dtype
+    )
+    new_input_ids = torch.cat([prompt_ids, pred_ids], dim=0).unsqueeze(0)
+    new_attention_mask = torch.ones_like(new_input_ids)
+    new_labels = new_input_ids.clone()
+    new_labels[:, :prompt_len] = -100  # ignore prompt tokens in loss
+
+    query_batch = {
+        "input_ids": new_input_ids,
+        "attention_mask": new_attention_mask,
+        "labels": new_labels
+    }
+
+    # DEBUG
+    # new_labels[:, :(prompt_len+3)] = -100  # ignore prompt tokens in loss
+    # original_id = new_input_ids[0][2316]
+    # new_input_ids[0][2316] = torch.tensor(tokenizer.convert_tokens_to_ids(['\\n']))[0]
+    # result = infer.masked_inference(query_batch, target_idx=torch.tensor([2317], dtype=torch.int64))
+    # print_query_and_answer(result["prev_text"][0], result["answer_text"][0], result["pred_text"][0])
+    # new_input_ids[0][2316] = original_id
+
+    # Part 2: use the new gradient
+
+    # 3) Empirical influence (overfit on the new ground-truth batch)
+    scores, indices = infer.influence_gradient_single(
+        query_batch=query_batch,
+        target_idx=2317
+    )
+
+    # select 20 largest then filter out short ones, we cannot compute token level saliency for too long trainging samples
+    most_related_samples = nlargest(20, zip(indices, scores), key=lambda x: x[1])
+    pprint(most_related_samples)
+
+    saliency_analysis_samples = []
+    for idx, score in most_related_samples:
+        if train_ds["input_ids"][idx].shape[0] <= 2000:
+            saliency_analysis_samples.append((idx, score))
+    saliency_analysis_samples = saliency_analysis_samples[:10]
+
+    # run inference and dump all results
+    dumped_json = {
+        "related_train_samples": [],
+        "target_test_sample": {}
+    }
+    dumped_json["target_test_sample"]["before"] = {
+        "full_tokens": result["pred_full_tokens"][0],
+        "start_index": result["target_idx"][0],
+        "saliency_list": result["saliency_generation"][0]
+    }
+
+    for i, sim in tqdm(saliency_analysis_samples, desc='Analyzing training sample saliency'):
+        # Build query batch
+        temp_ds = build_single_sample_query_batch(train_samples[i], convert_to_chatml_with_tokenizer)    # choose a proper length sample, or it will cuda oom
+        query_batch = base_collator([temp_ds[0]])
+
+        for k, v in query_batch.items():
+            query_batch[k] = v.to(accelerator.device)
+
+        result_0 = infer.masked_inference(query_batch)
+
+        dumped_json["related_train_samples"].append({
+            "target_idx": result_0["target_idx"][0],
+            "before_original": {
+                "full_tokens": result_0["full_tokens"][0],
+                "start_index": result_0["target_idx"][0],
+                "saliency_list": result_0["saliency_original"][0]
+            },
+            "before_generation": {
+                "full_tokens": result_0["pred_full_tokens"][0],
+                "start_index": result_0["target_idx"][0],
+                "saliency_list": result_0["saliency_generation"][0]
+            }
+        })
+    
+    # compress json size
+    dumped_json = round_floats(dumped_json, 5)
+
+    with open('./latest_saliency.json', 'w', encoding = 'utf-8') as f:
+        json.dump(dumped_json ,f)
+    
+
 if __name__ == "__main__":
-    main()
+    # main_compute_new_inference_function()
+    main_compute_gradient_related_samples()
