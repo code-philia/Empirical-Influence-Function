@@ -29,6 +29,11 @@ def chatml_format_preprocess(sources,
         return_test_input_ids = False
     ) -> Dict:
 
+    # unescape \\n and \\t
+    for obj in sources:
+        for key in ["role", "content"]:
+            obj[key] = obj[key].replace('\\n', '\n').replace('\\t', '\t')
+
     roles = {"user": "<|im_start|>user", "assistant": "<|im_start|>assistant", "system": "<|im_start|>system"}
     
     im_start = tokenizer("<|im_start|>").input_ids[0]

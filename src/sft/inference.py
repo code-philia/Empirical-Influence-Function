@@ -17,8 +17,7 @@ class Color:
 
 
 def restore_escaped_characters(text: str):
-    text = text.encode().decode('unicode_escape')
-    text = text.replace('\t', '  ')
+    text = text.replace('\\n', '\n').replace('\\t', '  ')
     return text
 
 

@@ -91,6 +91,12 @@ def process_func_chatml(examples,
         {output}<|im_end|>
     并仅对 assistant 的回复部分计算 Loss。
     """
+
+    for key in ["system", "input", "output"]:
+        ls = examples[key]
+        for i in range(len(ls)):
+            ls[i] = ls[i].replace('\\n', '\n').replace('\\t', '\t')
+
     systems = examples["system"]
     inputs  = examples["input"]
     outputs = examples["output"]
