@@ -4,6 +4,7 @@ from heapq import nlargest
 import json
 import os
 from pprint import pprint
+from time import time
 import torch
 from torch import Tensor, nn
 from tqdm import tqdm
@@ -30,7 +31,7 @@ def patch_torch_to_inspect_tensor_shape():
     def _repr_with_shape(self: torch.Tensor, tensor_contents = None) -> str:
         # 1) prepend shape/dtype/device
         # 2) keep original tensor formatting
-        head = f"tensor(shape={tuple(self.shape)}, dtype={self.dtype}, device={self.device})\n"
+        head = f"tensor(shape={tuple(self.shape)}, dtype={self.dtype}, device={self.device})--"
         return head + _orig_repr(self)
 
     torch.Tensor.__repr__ = _repr_with_shape
@@ -94,16 +95,16 @@ class Qwen2ForCausalLMWithLastAttn(Qwen2ForCausalLM):
         )
 
 
-# Unfreeze target layers
+# Unfreeze attention layers
 target_layer_keywords = ["embed_tokens.weight"]  # or ["model.layers.27.mlp"]
-
-def unfreeze_params(model: torch.nn.Module):
-    for name, param in model.named_parameters():
-        if any(key in name for key in target_layer_keywords):
-            param.requires_grad = True
 
 def filter_params(name: str, param: Parameter):
     return any(key in name for key in target_layer_keywords) and param.requires_grad
+
+def unfreeze_target_params(model: torch.nn.Module):
+    for name, param in model.named_parameters():
+        if any(key in name for key in target_layer_keywords):
+            param.requires_grad = True
 
 
 def load_samples_from_formal_jsonl(jsonl_path: str):
@@ -146,7 +147,7 @@ def build_train_dataset(train_samples, convert_fn):
     return train_ds
 
 
-def build_single_sample_query_batch(sample, convert_fn):
+def build_single_sample_dataset(sample, convert_fn):
     # Build single-sample Dataset
     temp_ds = Dataset.from_dict({
         "input":  [sample["input"]],
@@ -163,7 +164,7 @@ def build_single_sample_query_batch(sample, convert_fn):
 
 
 def load_model_and_tokenizer():
-    abs_model_path = os.path.join(os.path.dirname(__file__), "sft/scripts/checkpoint-full-long-2")
+    abs_model_path = os.path.join(os.path.dirname(__file__), "sft/scripts/checkpoint-full")
     print(f"Loading model from {abs_model_path}...")
 
     tokenizer = AutoTokenizer.from_pretrained(abs_model_path, local_files_only=True)
@@ -182,12 +183,11 @@ def load_model_and_tokenizer():
         local_files_only=True
     ).eval()
 
-    # Freeze all
+    # Freeze params except attention params
     for param in model.parameters():
         param.requires_grad = False
 
-    # Unfreeze some
-    unfreeze_params(model)
+    unfreeze_target_params(model)
 
     return model, tokenizer
 
@@ -237,7 +237,7 @@ class NewInferenceFunction:
         self.param_snapshot_overfit: list[Parameter] | None = None
 
     @torch.no_grad()
-    def _save_model_params(self):
+    def save_model_params(self):
         model = self.model
         param_filter_fn = self.param_filter_fn
 
@@ -265,6 +265,9 @@ class NewInferenceFunction:
 
     @torch.no_grad()
     def _apply_gradient_update(self, grads, lr):
+        '''
+        Vanilla gradient update with no optimizer.
+        '''
         model = self.model
         param_filter_fn = self.param_filter_fn
 
@@ -276,7 +279,10 @@ class NewInferenceFunction:
                     param.data -= lr * grad_device
                 idx += 1
 
-    def _build_topk_mask(self, base_attention_mask, attn_scores, target_idx):
+    def _build_topk_attention_mask(self, base_attention_mask, attn_scores, target_idx):
+        '''
+        Compute a new attention mask base on top-k scores.
+        '''
         new_mask = base_attention_mask.clone()
         num_prev = target_idx
         if num_prev <= 1:
@@ -295,7 +301,7 @@ class NewInferenceFunction:
         return new_mask
 
     @torch.no_grad()
-    def masked_inference(self, batch, target_idx=None, gen_limit: int = 128):
+    def infer(self, batch, target_idx=None, gen_limit: int = 128):
         input_ids = batch["input_ids"].to(self.device)
         attention_mask = batch["attention_mask"].to(self.device)
 
@@ -314,7 +320,9 @@ class NewInferenceFunction:
         elif not isinstance(target_idx, Tensor):
             target_idx = torch.tensor(target_idx, device=input_ids.device)
 
-        # Part 1: single token inference
+        time_start = time()
+
+        # Part 1: single token inference, saliency on ground truth sequence
 
         outputs = self.model(
             input_ids=input_ids,
@@ -322,12 +330,18 @@ class NewInferenceFunction:
             return_dict=True,
         )
 
+        time_part_1_infer = time()
+        print(f'Inferring single token costs {(time_part_1_infer - time_start):.3f}s')
+
         _, _, saliency_original = compute_answer_only_saliency_masked_loss(
             self.model,
             batch,
             self.device,
             target_idx
         )
+
+        time_part_1_saliency = time()
+        print(f'Computing saliency of original sample costs {(time_part_1_saliency - time_part_1_infer):.3f}s')
 
         logits = outputs.logits
         batch_size = logits.size(0)
@@ -356,7 +370,7 @@ class NewInferenceFunction:
         if not isinstance(self.model, GenerationMixin):
             raise ValueError("Expect self.model to be GenerationMixin")
 
-        # Part 2: generation sequence inference
+        # Part 2: generation sequence inference, saliency on generated sequence
 
         gen_ids = self.model.generate(
             input_ids=trimmed_ids,
@@ -372,6 +386,9 @@ class NewInferenceFunction:
             raise ValueError("Expect gen_ids to be Tensor")
         if not isinstance(self.tokenizer.pad_token_id, int):
             raise ValueError("Expect pad_token_id to be int")
+
+        time_part_2_generation = time()
+        print(f'Generating full sequence of {gen_ids.size(dim=1) - trimmed_ids.size(dim=1)} tokens costs {(time_part_2_generation - time_part_1_saliency):.3f}s')
 
         # build generation batch and compute saliency on generated continuation
         gen_attention_mask = gen_ids.ne(int(self.tokenizer.pad_token_id)).to(dtype=attention_mask.dtype)
@@ -394,6 +411,10 @@ class NewInferenceFunction:
             self.device,
             target_idx
         )
+
+        time_part_2_saliency = time()
+        print(f'Computing saliency on the generation result costs {(time_part_2_saliency-time_part_2_generation):.3f}s')
+
         pred_ids, pred_text, pred_full_text = [], [], []
         full_text, answer_text = [], []
         pred_tokens, pred_full_tokens, full_tokens, answer_tokens = [], [], [], []
@@ -517,7 +538,7 @@ class NewInferenceFunction:
             loss_test_start = scalar.item()
             loss_test_tokenwise_start = tokenwise_raw[0][start_q:].cpu()
 
-        self.param_snapshot_original = self._save_model_params()
+        self.param_snapshot_original = self.save_model_params()
 
         # Overfitting
         loss_test_curr = loss_test_start
@@ -574,7 +595,7 @@ class NewInferenceFunction:
         all_scores = self.accelerator.gather(torch.tensor(local_scores, device=self.device))
         all_indices = self.accelerator.gather(indices_train)
 
-        self.param_snapshot_overfit = self._save_model_params()
+        self.param_snapshot_overfit = self.save_model_params()
         self.restore_model_params(self.param_snapshot_original)
 
         if not isinstance(all_scores, Tensor):
@@ -749,14 +770,14 @@ def main_compute_new_inference_function():
     )
 
     # Build query batch
-    temp_ds = build_single_sample_query_batch(test_samples[18], convert_to_chatml_with_tokenizer)    # choose a proper length sample, or it will cuda oom
+    temp_ds = build_single_sample_dataset(test_samples[18], convert_to_chatml_with_tokenizer)    # choose a proper length sample, or it will cuda oom
     query_batch = base_collator([temp_ds[0]])
 
     for k, v in query_batch.items():
         query_batch[k] = v.to(accelerator.device)
 
     # 1) Masked inference for one wrong sample
-    result = infer.masked_inference(query_batch)
+    result = infer.infer(query_batch)
     print_query_and_answer(result["prev_text"][0], result["answer_text"][0], result["pred_text"][0])
 
     # 2) Rebuild query batch using prediction as new ground truth
@@ -808,7 +829,7 @@ def main_compute_new_inference_function():
 
     infer.restore_model_params(infer.param_snapshot_overfit)
 
-    result = infer.masked_inference(query_batch)
+    result = infer.infer(query_batch)
     dumped_json["target_test_sample"]["after"] = {
         "full_tokens": result["full_tokens"][0],
         "start_index": result["target_idx"][0],
@@ -819,17 +840,17 @@ def main_compute_new_inference_function():
 
     for i, sim in tqdm(saliency_analysis_samples, desc='Analyzing training sample saliency'):
         # Build query batch
-        temp_ds = build_single_sample_query_batch(train_samples[i], convert_to_chatml_with_tokenizer)    # choose a proper length sample, or it will cuda oom
+        temp_ds = build_single_sample_dataset(train_samples[i], convert_to_chatml_with_tokenizer)    # choose a proper length sample, or it will cuda oom
         query_batch = base_collator([temp_ds[0]])
 
         for k, v in query_batch.items():
             query_batch[k] = v.to(accelerator.device)
 
-        result_0 = infer.masked_inference(query_batch)
+        result_0 = infer.infer(query_batch)
 
         infer.restore_model_params(infer.param_snapshot_overfit)
 
-        result_1 = infer.masked_inference(query_batch)
+        result_1 = infer.infer(query_batch)
 
         infer.restore_model_params(infer.param_snapshot_original)
 
@@ -880,7 +901,7 @@ def main_compute_gradient_related_samples():
     test_samples = load_samples_from_formal_jsonl("sft_test.jsonl")
 
     train_ds = build_train_dataset(train_samples, convert_to_chatml_with_tokenizer)
-    train_ds = train_ds.filter(lambda x: len(x["input_ids"]) <= 2000)
+    train_ds = train_ds.filter(lambda x: len(x["input_ids"]) <= 3000)   # prevent compute_gradients OOM
 
     base_collator = DataCollatorForSeq2Seq(
         tokenizer=tokenizer,
@@ -914,15 +935,27 @@ def main_compute_gradient_related_samples():
     )
 
     # Build query batch
-    temp_ds = build_single_sample_query_batch(test_samples[18], convert_to_chatml_with_tokenizer)    # choose a proper length sample, or it will cuda oom
+    temp_ds = build_single_sample_dataset(test_samples[18], convert_to_chatml_with_tokenizer)    # choose a proper length sample, or it will cuda oom
     query_batch = base_collator([temp_ds[0]])
 
     for k, v in query_batch.items():
         query_batch[k] = v.to(accelerator.device)
 
+    # run inference and dump all results
+    dumped_json = {
+        "related_train_samples": [],
+        "target_test_sample": {}
+    }
+
     # 1) Masked inference for one wrong sample
-    result = infer.masked_inference(query_batch)
+    result = infer.infer(query_batch)
     print_query_and_answer(result["prev_text"][0], result["answer_text"][0], result["pred_text"][0])
+
+    dumped_json["target_test_sample"]["before"] = {
+        "full_tokens": result["full_tokens"][0],
+        "start_index": result["target_idx"][0],
+        "saliency_list": result["saliency_original"][0]
+    }
 
     # 2) Rebuild query batch using prediction as new ground truth
     prompt_len = int(result["target_idx"][0])
@@ -956,25 +989,20 @@ def main_compute_gradient_related_samples():
     # 3) Empirical influence (overfit on the new ground-truth batch)
     scores, indices = infer.influence_gradient_single(
         query_batch=query_batch,
-        target_idx=2317
+        target_idx=2006
     )
 
-    # select 20 largest then filter out short ones, we cannot compute token level saliency for too long trainging samples
-    most_related_samples = nlargest(20, zip(indices, scores), key=lambda x: x[1])
+    # select 20 largest then filter out short ones, we cannot compute token level saliency for too long training samples
+    most_related_samples = nlargest(20, zip(indices, scores), key=lambda x: abs(x[1]))
     pprint(most_related_samples)
 
     saliency_analysis_samples = []
     for idx, score in most_related_samples:
-        if train_ds["input_ids"][idx].shape[0] <= 2000:
+        if train_ds["input_ids"][idx].shape[0] <= 3000:        # prevent compute_gradients OOM
             saliency_analysis_samples.append((idx, score))
     saliency_analysis_samples = saliency_analysis_samples[:10]
 
-    # run inference and dump all results
-    dumped_json = {
-        "related_train_samples": [],
-        "target_test_sample": {}
-    }
-    dumped_json["target_test_sample"]["before"] = {
+    dumped_json["target_test_sample"]["after"] = {
         "full_tokens": result["pred_full_tokens"][0],
         "start_index": result["target_idx"][0],
         "saliency_list": result["saliency_generation"][0]
@@ -982,13 +1010,13 @@ def main_compute_gradient_related_samples():
 
     for i, sim in tqdm(saliency_analysis_samples, desc='Analyzing training sample saliency'):
         # Build query batch
-        temp_ds = build_single_sample_query_batch(train_samples[i], convert_to_chatml_with_tokenizer)    # choose a proper length sample, or it will cuda oom
+        temp_ds = build_single_sample_dataset(train_samples[i], convert_to_chatml_with_tokenizer)    # choose a proper length sample, or it will cuda oom
         query_batch = base_collator([temp_ds[0]])
 
         for k, v in query_batch.items():
             query_batch[k] = v.to(accelerator.device)
 
-        result_0 = infer.masked_inference(query_batch)
+        result_0 = infer.infer(query_batch)
 
         dumped_json["related_train_samples"].append({
             "target_idx": result_0["target_idx"][0],
