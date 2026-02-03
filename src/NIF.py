@@ -3,6 +3,7 @@ from functools import partial
 from heapq import nlargest
 import json
 import os
+import re
 from pprint import pprint
 from time import time
 import torch
@@ -22,6 +23,12 @@ from torch.utils.data import DataLoader
 from torch.utils.data import Dataset as TorchDataset
 
 from torch.nn import Parameter
+
+
+SEED = 42
+SEQUENCE_LENGTH_LIMIT = 3000
+SELECTED_TEST_SAMPLE_INDEX = 18
+TOKEN_INDEX_TO_RETRIEVE = 2001
 
 
 # dev-only patch, to see the shape of tensor when debugging
@@ -200,6 +207,150 @@ def _find_subseq_start(row: torch.Tensor, subseq: tuple[int, int, int]) -> int:
     raise ValueError("marker sequence not found")
 
 
+def finetune_on_sample(model, tokenizer, question: str = "", answer: str = "", mode: str = "supervised", *, epochs: int = 1, lr: float = 5e-5, input_ids: Tensor | None = None, labels: Tensor | None = None, boost_indices: list[int] | None = None, boost: float = 10.0):
+    device = next(model.parameters()).device
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)       
+
+    if mode == "supervised":
+        if input_ids is None or labels is None:
+            enc_q = tokenizer(question, return_tensors="pt").to(device)
+            enc_a = tokenizer(answer, return_tensors="pt").to(device)
+            # 1) Concatenate question+answer and mask question tokens in labels
+            input_ids = torch.cat([enc_q["input_ids"], enc_a["input_ids"]], dim=1)
+            labels = torch.cat([torch.full_like(enc_q["input_ids"], -100), enc_a["input_ids"]], dim=1)
+
+        marker_ids = tuple(
+            tokenizer.encode("<|im_start|>assistant\n", add_special_tokens=False)
+        )
+        if len(marker_ids) != 3:
+            raise ValueError("expected three-token marker for <|im_start|>assistant\\n")
+        for i in range(input_ids.size(0)):
+            start = _find_subseq_start(input_ids[i], marker_ids) + 3
+            labels[i, :start] = -100
+
+    elif mode == "unsupervised":
+        if input_ids is None or labels is None:
+            text = question + answer
+            enc = tokenizer(text, return_tensors="pt").to(device)
+            input_ids = labels = enc["input_ids"]
+    else:
+        raise ValueError("mode must be 'supervised' or 'unsupervised'")
+    
+    if not isinstance(input_ids, Tensor):
+        raise ValueError("Expect input_ids to be Tensor")
+    if not isinstance(labels, Tensor):
+        raise ValueError("Expect labels to be Tensor")
+    input_ids = input_ids.to(device=device)
+    labels = labels.to(device=device)
+
+    def _grad_hook(idx: Tensor) -> Callable[[Tensor], Tensor]:
+        def hook(grad: Tensor):
+            # grad shape: [batch, heads, tgt_len, src_len]; scale only last query token over selected src indices
+            src_mask = torch.zeros(grad.size(-1), device=grad.device, dtype=grad.dtype)
+            src_mask[idx] = 1.0     # cannot define this function in loop, because of pylint [cell-var-from-loop / W0640]
+            factor = 1.0 + (boost - 1.0) * src_mask.view(1, 1, 1, -1)  # broadcast to [1,1,1,src_len]
+            grad = grad.clone()
+            grad[:, :, -1:, :] *= factor  # only last query token (tgt_len - 1)
+            return grad
+        return hook
+
+    for _ in tqdm(range(epochs), desc="Finetuning on sample"):
+        out = model(input_ids=input_ids, labels=labels, save_last_attention=True)
+
+        if boost_indices is not None:
+            attn = out.attentions[-1]
+            if not isinstance(attn, Tensor):
+                raise ValueError("Expect attn to be Tensor")
+            
+            idx = torch.tensor(boost_indices, device=device)
+            attn.register_hook(_grad_hook(idx))
+
+        loss = out.loss
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+
+
+_TAG_RE = re.compile(r"<ATTN>(.*?)</ATTN>", re.DOTALL)
+
+def extract_attn_segments(text: str) -> tuple[str, list[tuple[int, int]]]:
+    """
+    Return cleaned text and spans of content originally inside <ATTN> tags.
+
+    Spans are character offsets [start, end) in the cleaned text.
+    """
+    spans: list[tuple[int, int]] = []
+    out_parts: list[str] = []
+    cursor = 0
+    out_len = 0
+
+    # 1) Scan tagged segments in source order
+    for m in _TAG_RE.finditer(text):
+        # Append text before tag
+        pre = text[cursor:m.start()]
+        out_parts.append(pre)
+        out_len += len(pre)
+
+        # Append tag content and record span in cleaned text
+        content = m.group(1)
+        start = out_len
+        out_parts.append(content)
+        out_len += len(content)
+        end = out_len
+        spans.append((start, end))
+
+        cursor = m.end()
+
+    # 2) Append trailing text after last tag
+    out_parts.append(text[cursor:])
+
+    # 3) Join for cleaned text
+    cleaned = "".join(out_parts)
+    return cleaned, spans
+
+
+def tokenize_with_marked_tokens(text: str, tokenizer: PreTrainedTokenizer):
+    cleaned, spans = extract_attn_segments(text)
+    result = tokenizer(cleaned, return_tensors="pt", return_offsets_mapping=True)
+
+    offset_mapping_tensor = result['offset_mapping']
+    if not isinstance(offset_mapping_tensor, Tensor):
+        raise ValueError("Expect offset_mapping_tensor to be Tensor")
+    offset_mapping = offset_mapping_tensor[0].tolist()
+    marked_indices = []
+
+    len_spans = len(spans)
+    i_span = 0
+    in_span = False
+    for i, (token_start, token_end) in enumerate(offset_mapping):
+        while i_span < len_spans:
+            span_start, span_end = spans[i_span]
+            if token_end <= span_start:     # move to next token
+                break
+            elif span_end <= token_start:   # move to next span
+                i_span += 1
+            else:                           # token_end > span_start and span_end > token_start
+                in_span = True
+                i_span += 1
+        
+        if in_span:
+            marked_indices.append(i)
+
+        in_span = False
+
+        if i_span >= len_spans:
+            break
+
+    return {
+        **result,
+        "marked_indices": marked_indices
+    }
+
+
+def convert_sample_to_full_text(sample):
+    return f"<|im_start|>system\n{sample['system']}<|im_end|>\n<|im_start|>user\n{sample['input']}<|im_end|>\n<|im_start|>assistant\n{sample['output']}<|im_end|>"
+
+
 class NewInferenceFunction:
     def __init__(
         self,
@@ -348,9 +499,9 @@ class NewInferenceFunction:
 
         prev_ids, prev_text, out_ids, out_text = [], [], [], []
         for i in range(batch_size):
-            pos = int(target_idx[i].item()) - 1
+            pos = int(target_idx[i].item())
             original_prev_ids = input_ids[i, :pos].tolist()
-            out_token_id = int(torch.argmax(logits[i, pos], dim=-1).item())
+            out_token_id = int(torch.argmax(logits[i, pos-1], dim=-1).item())  # shifted
 
             prev_ids.append(original_prev_ids)
             prev_text.append(self.tokenizer.decode(original_prev_ids))
@@ -889,7 +1040,7 @@ def main_compute_gradient_related_samples():
     # Part 1: the preparation remain the same
     
     accelerator = Accelerator()
-    set_seed(42)
+    set_seed(SEED)
 
     model, tokenizer = load_model_and_tokenizer()
 
@@ -901,7 +1052,7 @@ def main_compute_gradient_related_samples():
     test_samples = load_samples_from_formal_jsonl("sft_test.jsonl")
 
     train_ds = build_train_dataset(train_samples, convert_to_chatml_with_tokenizer)
-    train_ds = train_ds.filter(lambda x: len(x["input_ids"]) <= 3000)   # prevent compute_gradients OOM
+    train_ds = train_ds.filter(lambda x: len(x["input_ids"]) <= SEQUENCE_LENGTH_LIMIT)   # prevent compute_gradients OOM
 
     base_collator = DataCollatorForSeq2Seq(
         tokenizer=tokenizer,
@@ -925,7 +1076,7 @@ def main_compute_gradient_related_samples():
     # Assume: model, tokenizer already loaded
     # Assume: query_batch already built with input_ids and attention_mask
 
-    infer = NewInferenceFunction(
+    inference_function = NewInferenceFunction(
         model=model,
         tokenizer=tokenizer,
         train_loader=train_loader,
@@ -935,8 +1086,10 @@ def main_compute_gradient_related_samples():
     )
 
     # Build query batch
-    temp_ds = build_single_sample_dataset(test_samples[18], convert_to_chatml_with_tokenizer)    # choose a proper length sample, or it will cuda oom
+    temp_ds = build_single_sample_dataset(test_samples[SELECTED_TEST_SAMPLE_INDEX], convert_to_chatml_with_tokenizer)    # choose a proper length sample, or it will cuda oom
     query_batch = base_collator([temp_ds[0]])
+    if len(temp_ds[0]['input_ids']) > SEQUENCE_LENGTH_LIMIT:
+        raise ValueError(f'This test sample (index {SELECTED_TEST_SAMPLE_INDEX}) has too long text')
 
     for k, v in query_batch.items():
         query_batch[k] = v.to(accelerator.device)
@@ -948,7 +1101,7 @@ def main_compute_gradient_related_samples():
     }
 
     # 1) Masked inference for one wrong sample
-    result = infer.infer(query_batch)
+    result = inference_function.infer(query_batch)
     print_query_and_answer(result["prev_text"][0], result["answer_text"][0], result["pred_text"][0])
 
     dumped_json["target_test_sample"]["before"] = {
@@ -969,6 +1122,7 @@ def main_compute_gradient_related_samples():
     new_attention_mask = torch.ones_like(new_input_ids)
     new_labels = new_input_ids.clone()
     new_labels[:, :prompt_len] = -100  # ignore prompt tokens in loss
+    new_labels[:, (TOKEN_INDEX_TO_RETRIEVE+1):] = -100
 
     query_batch = {
         "input_ids": new_input_ids,
@@ -987,20 +1141,71 @@ def main_compute_gradient_related_samples():
     # Part 2: use the new gradient
 
     # 3) Empirical influence (overfit on the new ground-truth batch)
-    scores, indices = infer.influence_gradient_single(
+    scores, indices = inference_function.influence_gradient_single(
         query_batch=query_batch,
-        target_idx=2006
+        target_idx=TOKEN_INDEX_TO_RETRIEVE
     )
 
     # select 20 largest then filter out short ones, we cannot compute token level saliency for too long training samples
-    most_related_samples = nlargest(20, zip(indices, scores), key=lambda x: abs(x[1]))
+    most_related_samples = nlargest(len(indices), zip(indices, scores), key=lambda x: x[1])
     pprint(most_related_samples)
 
     saliency_analysis_samples = []
     for idx, score in most_related_samples:
-        if train_ds["input_ids"][idx].shape[0] <= 3000:        # prevent compute_gradients OOM
+        if train_ds["input_ids"][idx].shape[0] <= SEQUENCE_LENGTH_LIMIT:        # prevent compute_gradients OOM
             saliency_analysis_samples.append((idx, score))
     saliency_analysis_samples = saliency_analysis_samples[:10]
+
+#     # train on salient samples
+#     for idx, score in saliency_analysis_samples[:1]:
+#         sample = train_samples[idx]
+#         text = '''<|im_start|>system
+# You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+# <|im_start|>user
+# This is a go programming task on some code contents. Given task: The task is to fill in the missing part of a go function according to the provided code   content. Below is the package path:github.com/kubernetes/Kubernetes/vendor/golang.org/x/tools/go/types/typeutil Below is the code repository: github.com/kubernetes/Kubernetes/ Below is the imported package path "go/types"; "sync" The receiver struct definitions of the function is type MethodSetCache struct {
+#   mu     sync.Mutex
+#   named  map[*types.Named]struct{ value, pointer *types.MethodSet } // method sets for named N and *N
+#   others map[types.Type]*types.MethodSet                            // all other types
+# }
+
+# // Methods:
+# - func (cache *MethodSetCache) MethodSet(T types.Type) *types.MethodSet
+# - func (cache *MethodSetCache) lookupNamed(named *types.Named) *ast.StructType
+#  The parameter struct definition or not exist of the function is T types.Type The return value struct definitions or not exist of the function is *types.MethodSet The code snippets before the function is not exist And here is the function you are asked to complete func (cache *MethodSetCache) MethodSet(T types.Type) *types.MethodSet
+# func (cache *MethodSetCache) MethodSet(T types.Type) *types.MethodSet {
+#   if cache == nil {
+#     return types.NewMethodSet(T)
+#   }
+#   cache.mu.Lock()
+#   defer cache.mu.Unlock()
+
+#   switch T := types.Unalias(T).(type) {
+#   case *types.Named:
+#     return cache.lookupNamed(T).value
+
+#   case *types.Pointer:
+#     if N, ok := types.Unalias(T.Elem()).(*types.Named); ok {
+#       return cache.lookupNamed(N).pointer
+#     }
+#   }
+
+#   // all other types
+#   // (The map uses pointer equivalence, not type identity.)
+#   mset := cache.<ATTN>others</ATTN>[T]
+#   if mset == nil { <MID>   }
+#   return mset
+# } Ensure that only missing codes marked as <MID> are returned<|im_end|>
+# <|im_start|>assistant
+#     mset = types.NewMethodSet(T)
+#     if cache.others == nil {
+#       cache.others = make(map[types.Type]*types.MethodSet)
+#     }
+#     cache.others[T] = mset<|im_end|>'''
+#         token_result = tokenize_with_marked_tokens(text, tokenizer)
+
+#         finetune_on_sample(model, tokenizer, epochs=10, input_ids=token_result['input_ids'], labels=token_result['input_ids'].clone(), boost_indices=token_result['marked_indices'])
+#         result = inference_function.infer(query_batch)
+#         print_query_and_answer(result["prev_text"][0], result["answer_text"][0], result["pred_text"][0])
 
     dumped_json["target_test_sample"]["after"] = {
         "full_tokens": result["pred_full_tokens"][0],
@@ -1016,7 +1221,7 @@ def main_compute_gradient_related_samples():
         for k, v in query_batch.items():
             query_batch[k] = v.to(accelerator.device)
 
-        result_0 = infer.infer(query_batch)
+        result_0 = inference_function.infer(query_batch)
 
         dumped_json["related_train_samples"].append({
             "target_idx": result_0["target_idx"][0],
