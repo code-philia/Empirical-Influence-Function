@@ -6,6 +6,7 @@ import os
 import re
 from pprint import pprint
 from time import time
+from typing import Literal
 import torch
 from torch import Tensor, nn
 from tqdm import tqdm
@@ -386,7 +387,7 @@ class NewInferenceFunction:
         self.param_snapshot_overfit: list[Parameter] | None = None
 
     @torch.no_grad()
-    def save_model_params(self):
+    def save_model_params(self, to: Literal["original"] | Literal["overfit"] | None = "original"):
         model = self.model
         param_filter_fn = self.param_filter_fn
 
@@ -394,6 +395,12 @@ class NewInferenceFunction:
         for name, param in model.named_parameters():
             if param.requires_grad and (param_filter_fn is None or param_filter_fn(name, param)):
                 snapshot.append(param.detach().cpu().clone())
+
+        if to == "original":
+            self.param_snapshot_original = snapshot
+        elif to == "overfit":
+            self.param_snapshot_overfit = snapshot
+
         return snapshot
 
     @torch.no_grad()
@@ -706,7 +713,7 @@ class NewInferenceFunction:
             loss_test_start = scalar.item()
             loss_test_tokenwise_start = tokenwise_raw[0][start_q:].cpu()
 
-        self.param_snapshot_original = self.save_model_params()
+        self.save_model_params(to="original")
 
         # Overfitting
         loss_test_curr = loss_test_start
@@ -763,7 +770,7 @@ class NewInferenceFunction:
         all_scores = self.accelerator.gather(torch.tensor(local_scores, device=self.device))
         all_indices = self.accelerator.gather(indices_train)
 
-        self.param_snapshot_overfit = self.save_model_params()
+        self.save_model_params(to="overfit")
         self.restore_model_params(self.param_snapshot_original)
 
         if not isinstance(all_scores, Tensor):
@@ -1098,7 +1105,7 @@ def main_compute_gradient_related_samples():
         tokenizer=tokenizer,
         train_loader=train_loader,
         accelerator=accelerator,
-        param_filter_fn=filter_params,
+        param_filter_fn=None,
         top_k=20,
     )
 
@@ -1212,46 +1219,66 @@ def main_compute_gradient_related_samples():
         token_result = tokenize_with_marked_tokens(text, tokenizer)
         token_samples.append(token_result)
 
-    for epoch in range(10):
-        for sample in token_samples:
-            finetune_on_sample(
-                model,
-                tokenizer,
-                epochs=1,
-                input_ids=sample['input_ids'],
-                labels=sample['input_ids'].clone(),
-                boost_indices=sample['marked_indices'],
-                boost_coef=10.0
-            )
-    
-    result = inference_function.infer(query_batch)
-    print_query_and_answer(result["prev_text"][0], result["answer_text"][0], result["pred_text"][0])
+    for coef in [1, 10, 100, 1000, 10000]:
+        inference_function.save_model_params()
+
+        for epoch in range(10):
+            for sample in token_samples:
+                finetune_on_sample(
+                    model,
+                    tokenizer,
+                    epochs=1,
+                    input_ids=sample['input_ids'],
+                    labels=sample['input_ids'].clone(),
+                    boost_indices=sample['marked_indices'],
+                    boost_coef=coef
+                )
+        
+        result = inference_function.infer(query_batch)
+        print(f"Finetuned on boost_coef = {coef}")
+        print_query_and_answer(result["prev_text"][0], result["answer_text"][0], result["pred_text"][0])
+
+        dumped_json["related_train_samples"].append({
+            "target_idx": result["target_idx"][0],
+            "before_original": {
+                "full_tokens": result["pred_full_tokens"][0],
+                "start_index": result["target_idx"][0],
+                "saliency_list": result["saliency_generation"][0]
+            },
+            "before_generation": {
+                "full_tokens": result["pred_full_tokens"][0],
+                "start_index": result["target_idx"][0],
+                "saliency_list": result["saliency_generation"][0]
+            }
+        })
+        
+        inference_function.restore_model_params()
 
     # record training sample saliency
 
-    for i, sim in tqdm(saliency_analysis_samples, desc='Analyzing training sample saliency'):
-        # Build query batch
-        temp_ds = build_single_sample_dataset(train_samples[i], convert_to_chatml_with_tokenizer)    # choose a proper length sample, or it will cuda oom
-        query_batch = base_collator([temp_ds[0]])
+    # for i, sim in tqdm(saliency_analysis_samples, desc='Analyzing training sample saliency'):
+    #     # Build query batch
+    #     temp_ds = build_single_sample_dataset(train_samples[i], convert_to_chatml_with_tokenizer)    # choose a proper length sample, or it will cuda oom
+    #     query_batch = base_collator([temp_ds[0]])
 
-        for k, v in query_batch.items():
-            query_batch[k] = v.to(accelerator.device)
+    #     for k, v in query_batch.items():
+    #         query_batch[k] = v.to(accelerator.device)
 
-        result_0 = inference_function.infer(query_batch)
+    #     result_0 = inference_function.infer(query_batch)
 
-        dumped_json["related_train_samples"].append({
-            "target_idx": result_0["target_idx"][0],
-            "before_original": {
-                "full_tokens": result_0["full_tokens"][0],
-                "start_index": result_0["target_idx"][0],
-                "saliency_list": result_0["saliency_original"][0]
-            },
-            "before_generation": {
-                "full_tokens": result_0["pred_full_tokens"][0],
-                "start_index": result_0["target_idx"][0],
-                "saliency_list": result_0["saliency_generation"][0]
-            }
-        })
+    #     dumped_json["related_train_samples"].append({
+    #         "target_idx": result_0["target_idx"][0],
+    #         "before_original": {
+    #             "full_tokens": result_0["full_tokens"][0],
+    #             "start_index": result_0["target_idx"][0],
+    #             "saliency_list": result_0["saliency_original"][0]
+    #         },
+    #         "before_generation": {
+    #             "full_tokens": result_0["pred_full_tokens"][0],
+    #             "start_index": result_0["target_idx"][0],
+    #             "saliency_list": result_0["saliency_generation"][0]
+    #         }
+    #     })
     
     # compress json size
     dumped_json = round_floats(dumped_json, 5)
