@@ -29,12 +29,13 @@ from torch.nn import Parameter
 
 SEED = 42
 SEQUENCE_LENGTH_LIMIT = 3000
-SELECTED_TEST_SAMPLE_INDEX = 34
 TRAIN_SAMPLE_RETRIEVE_LIMIT = 100
+SELECTED_TEST_SAMPLE_INDEX = 34
 TOKEN_INDEX_TO_RETRIEVE = 438
 
 
 # dev-only patch, to see the shape of tensor when debugging
+
 def patch_torch_to_inspect_tensor_shape():
     _orig_repr = torch.Tensor.__repr__
 
@@ -51,6 +52,7 @@ patch_torch_to_inspect_tensor_shape()
 
 
 # disable the "Map: ..." progress bar in Dataset
+
 from datasets.utils.logging import disable_progress_bar
 disable_progress_bar()
 
@@ -897,7 +899,9 @@ class DatasetWrapper(TorchDataset):
 
 
 def main_compute_new_inference_function():
-
+    '''
+    Deprecated. The workflow to overfit on the target test sample.
+    '''
     accelerator = Accelerator()
     set_seed(42)
 
@@ -1061,6 +1065,10 @@ def main_compute_new_inference_function():
 
 
 def main_compute_gradient_related_samples():
+    '''
+    The workflow to compute gradient on target test sample, no overfitting.
+    '''
+
     # Part 1: the preparation remain the same
     
     accelerator = Accelerator()
@@ -1171,37 +1179,40 @@ def main_compute_gradient_related_samples():
     # Part 2: use the new gradient
 
     # 3) Empirical influence (overfit on the new ground-truth batch)
-    # scores, indices = inference_function.influence_gradient_single(
-    #     query_batch=query_batch,
-    #     target_idx=TOKEN_INDEX_TO_RETRIEVE
-    # )
+    # saved to file, and you can comment this part to prevent retrieving again, because it takes ~1h
+    scores, indices = inference_function.influence_gradient_single(
+        query_batch=query_batch,
+        target_idx=TOKEN_INDEX_TO_RETRIEVE
+    )
+    with open(os.path.join(os.path.dirname(__file__), f'../test_{SELECTED_TEST_SAMPLE_INDEX}_{TOKEN_INDEX_TO_RETRIEVE}_result.json'), 'r', encoding='utf-8') as f:
+        json.dump({"result": list(zip(scores, indices))}, f)
 
+    # read from saved data
     # select 20 largest then filter out short ones, we cannot compute token level saliency for too long training samples
-    with open(os.path.join(os.path.dirname(__file__), '../test_34_result.json'), 'r', encoding='utf-8') as f:
-        temp_most_related_samples = json.load(f)
-    most_related_samples = temp_most_related_samples['result']
+    with open(os.path.join(os.path.dirname(__file__), f'../test_{SELECTED_TEST_SAMPLE_INDEX}_{TOKEN_INDEX_TO_RETRIEVE}_result.json'), 'r', encoding='utf-8') as f:
+        most_related_samples_json = json.load(f)
+    most_related_samples = most_related_samples_json['result']
     # pprint(most_related_samples)
 
-    saliency_analysis_samples = []
-    for idx, score in most_related_samples:
-        saliency_analysis_samples.append((idx, score))
-    saliency_analysis_samples = nlargest(10, saliency_analysis_samples, lambda x: -x[1])
-    # saliency_analysis_samples = saliency_analysis_samples[:10]
+    # lambda x: x[1] -> top bad samples
+    # lambda x: -x[1] -> top good samples
+    # lambda x: abs(x[1]) -> top related samples
+    saliency_analysis_samples = nlargest(10, most_related_samples, lambda x: -x[1])
 
     # print the top 10 samples as code blocks
-    # and copy them to GPT-5.2 manually,
     # output to file, or the \t will be converted to spaces in terminal
+    # copy them to GPT-5.2 manually
 
     samples_text = '```\n' + '\n```\n\n```\n'.join(map(convert_sample_to_full_text, [train_samples[i] for i, s in saliency_analysis_samples])) + '\n```'
+    prompt = '''Above are full training samples of go code completion, please:
+1. The `<|im_start|>user` part is the question part, and the `<|im_start|>assistant` part is the answer part as the correct answer. The `<MID>` is a completion placeholder which you should not modify. Mark 3-10 words in the question part that you think that are most contributive to the correct answer with `<ATTN></ATTN>`, but don't mark the `<MID>`. These words must natively appear in the context, and not in the natural languag text, but code text.
+2. Then output only one code block for each sample containing the marked full training sample again, not just the marked part.'''
     with open(os.path.join(os.path.dirname(__file__), '../samples_in_code_blocks.md'), 'w', encoding='utf-8') as f:
         f.write(samples_text)
-    
-    # prompt:
-    # Above are full training samples of go code completion, please:
-    # 1. The "<|im_start|>user" part is the question part, and the "<|im_start|>assistant" part is the answer part. The "<MID>" is a completion placeholder which you should not modify or mark. Mark 5 words in the question part that you think that are most contributive, with `<ATTN></ATTN>`. These words must natively appear in the context, and not in the natural languag text, but code text.
-    # 2. Then output only one code block for each sample containing the marked full training sample again, not just the marked part.
+        f.write("\n\n")
+        f.write(prompt)
 
-    # train on salient samples marked by GPT-5.2, which is manually collected
+    # Option 1: train on salient samples marked by GPT-5.2, which is manually collected
 
     def extract_fenced_code_blocks(text: str) -> list[str]:
         # 1) Match ```lang?\n ... \n``` with DOTALL to span multiple lines
@@ -1254,7 +1265,7 @@ def main_compute_gradient_related_samples():
         
         inference_function.restore_model_params()
 
-    # record training sample saliency
+    # Option 2: record training sample saliency
 
     # for i, sim in tqdm(saliency_analysis_samples, desc='Analyzing training sample saliency'):
     #     # Build query batch

@@ -14,10 +14,8 @@ def compute_loss_per_sample(model, batch, device, ignored_token_ids):
         ignored_token_ids = ignored_token_ids.to(device)
 
     inputs = {k: v.to(device) for k, v in batch.items() if k in ['input_ids', 'attention_mask', 'labels']}
-    outputs = model(**inputs, return_dict=True, output_attentions=False, use_cache=False)
+    outputs = model(**inputs, return_dict=True)
     logits = outputs.logits.float()
-
-    del outputs
 
     # 1. 进行错位
     shift_logits = logits[..., :-1, :].contiguous()
@@ -139,7 +137,7 @@ def compute_answer_only_saliency_masked_loss(
     Returns a tuple:
     - `mean_loss`:                of shape `(batch,)`.
     - `weighted_token_losses`:    of shape `(batch, token)`.
-    - `saliency_list`:            list[list[dict]], of shape `(batch, from_token, to_token)`.
+    - `saliency_list`:            list[list[dict]], of shape `(batch, target_token, previous_token)`.
     '''
     if ignored_token_ids is not None and not isinstance(ignored_token_ids, torch.Tensor):
         ignored_token_ids = torch.tensor(ignored_token_ids, device=device)
@@ -188,14 +186,12 @@ def compute_answer_only_saliency_masked_loss(
             # gradients from target logits to input embeddings
             grads = torch.autograd.grad(picked, embeddings, retain_graph=False, create_graph=False)[0]
 
-        saliency = (embeddings * grads).abs().sum(dim=-1)   # [B, T, E]
+        saliency = (embeddings * grads).abs().sum(dim=-1)   # [batch, token], l1 norm
         k = min(top_k, saliency.size(-1))
 
         # get top-k saliency token indices
         topk_indices = torch.topk(saliency, k=k, dim=-1).indices
         
-
-
         # build masks
         mask = torch.zeros((bsz, k_len), device=device, dtype=torch.bool)
         mask.scatter_(1, topk_indices, True)
