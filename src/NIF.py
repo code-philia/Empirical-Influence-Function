@@ -1128,13 +1128,12 @@ def main_compute_gradient_related_samples():
     for k, v in query_batch.items():
         query_batch[k] = v.to(accelerator.device)
 
-    # run inference and dump all results
     dumped_json = {
         "related_train_samples": [],
         "target_test_sample": {}
     }
 
-    # 1) Masked inference for one wrong sample
+    # 1) Inference for one wrong sample
     result = inference_function.infer(query_batch)
     print_query_and_answer(result["prev_text"][0], result["answer_text"][0], result["pred_text"][0])
 
@@ -1186,8 +1185,8 @@ def main_compute_gradient_related_samples():
         query_batch=query_batch,
         target_idx=TOKEN_INDEX_TO_RETRIEVE
     )
-    with open(os.path.join(os.path.dirname(__file__), f'../test_{SELECTED_TEST_SAMPLE_INDEX}_{TOKEN_INDEX_TO_RETRIEVE}_result.json'), 'r', encoding='utf-8') as f:
-        json.dump({"result": list(zip(scores, indices))}, f)
+    with open(os.path.join(os.path.dirname(__file__), f'../test_{SELECTED_TEST_SAMPLE_INDEX}_{TOKEN_INDEX_TO_RETRIEVE}_result.json'), 'w', encoding='utf-8') as f:
+        json.dump({"result": list(zip(indices, scores))}, f)
 
     # read from saved data
     # select 20 largest then filter out short ones, we cannot compute token level saliency for too long training samples
