@@ -10,6 +10,7 @@ import torch
 from torch import Tensor, nn
 from tqdm import tqdm
 from transformers.modeling_outputs import CausalLMOutputWithPast
+from transformers.generation.utils import GenerateDecoderOnlyOutput
 from transformers import AutoConfig, AutoTokenizer, DataCollatorForSeq2Seq, GenerationMixin, PreTrainedTokenizer, Qwen2ForCausalLM, set_seed
 from accelerate import Accelerator
 
@@ -27,8 +28,9 @@ from torch.nn import Parameter
 
 SEED = 42
 SEQUENCE_LENGTH_LIMIT = 3000
-SELECTED_TEST_SAMPLE_INDEX = 18
-TOKEN_INDEX_TO_RETRIEVE = 2001
+SELECTED_TEST_SAMPLE_INDEX = 34
+TRAIN_SAMPLE_RETRIEVE_LIMIT = 100
+TOKEN_INDEX_TO_RETRIEVE = 438
 
 
 # dev-only patch, to see the shape of tensor when debugging
@@ -135,8 +137,8 @@ def load_samples_from_formal_jsonl(jsonl_path: str):
                         }
                     )
                     seen_inputs.add(inp)
-            if len(sample_list) >= 1000:
-                break
+            # if len(sample_list) >= 1000:
+            #     break
 
     return sample_list
 
@@ -190,11 +192,11 @@ def load_model_and_tokenizer():
         local_files_only=True
     ).eval()
 
-    # Freeze params except attention params
-    for param in model.parameters():
-        param.requires_grad = False
+    # # Freeze params except attention params
+    # for param in model.parameters():
+    #     param.requires_grad = False
 
-    unfreeze_target_params(model)
+    # unfreeze_target_params(model)
 
     return model, tokenizer
 
@@ -207,7 +209,7 @@ def _find_subseq_start(row: torch.Tensor, subseq: tuple[int, int, int]) -> int:
     raise ValueError("marker sequence not found")
 
 
-def finetune_on_sample(model, tokenizer, question: str = "", answer: str = "", mode: str = "supervised", *, epochs: int = 1, lr: float = 5e-5, input_ids: Tensor | None = None, labels: Tensor | None = None, boost_indices: list[int] | None = None, boost: float = 10.0):
+def finetune_on_sample(model, tokenizer, question: str = "", answer: str = "", mode: str = "supervised", *, epochs: int = 1, lr: float = 5e-5, input_ids: Tensor | None = None, labels: Tensor | None = None, boost_indices: list[int] | None = None, boost_coef: float = 10.0):
     device = next(model.parameters()).device
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)       
 
@@ -243,32 +245,26 @@ def finetune_on_sample(model, tokenizer, question: str = "", answer: str = "", m
     input_ids = input_ids.to(device=device)
     labels = labels.to(device=device)
 
-    def _grad_hook(idx: Tensor) -> Callable[[Tensor], Tensor]:
-        def hook(grad: Tensor):
-            # grad shape: [batch, heads, tgt_len, src_len]; scale only last query token over selected src indices
-            src_mask = torch.zeros(grad.size(-1), device=grad.device, dtype=grad.dtype)
-            src_mask[idx] = 1.0     # cannot define this function in loop, because of pylint [cell-var-from-loop / W0640]
-            factor = 1.0 + (boost - 1.0) * src_mask.view(1, 1, 1, -1)  # broadcast to [1,1,1,src_len]
-            grad = grad.clone()
-            grad[:, :, -1:, :] *= factor  # only last query token (tgt_len - 1)
-            return grad
-        return hook
-
-    for _ in tqdm(range(epochs), desc="Finetuning on sample"):
+    for _ in tqdm(range(epochs), desc="Finetuning on sample", leave=False):
         out = model(input_ids=input_ids, labels=labels, save_last_attention=True)
 
-        if boost_indices is not None:
-            attn = out.attentions[-1]
+        attn_loss = torch.tensor(0, dtype=torch.float32)
+        if boost_indices is not None and len(boost_indices) > 0:
+            attn = out.attentions[-1]   # [batch, head, q, k]
             if not isinstance(attn, Tensor):
                 raise ValueError("Expect attn to be Tensor")
             
             idx = torch.tensor(boost_indices, device=device)
-            attn.register_hook(_grad_hook(idx))
 
-        loss = out.loss
+            emphasized_attn = attn.clone()
+            emphasized_attn[:, :, :, idx] = emphasized_attn[:, :, :, idx] * boost_coef
+            attn_loss = (emphasized_attn - attn).mean()
+
+        loss = out.loss + attn_loss
         loss.backward()
         optimizer.step()
         optimizer.zero_grad()
+        # print(f"loss: {loss.item()}, out_loss: {out.loss.item()}, attn_loss: {attn_loss.item()}")
 
 
 _TAG_RE = re.compile(r"<ATTN>(.*?)</ATTN>", re.DOTALL)
@@ -348,7 +344,9 @@ def tokenize_with_marked_tokens(text: str, tokenizer: PreTrainedTokenizer):
 
 
 def convert_sample_to_full_text(sample):
-    return f"<|im_start|>system\n{sample['system']}<|im_end|>\n<|im_start|>user\n{sample['input']}<|im_end|>\n<|im_start|>assistant\n{sample['output']}<|im_end|>"
+    text = f"<|im_start|>system\n{sample['system']}<|im_end|>\n<|im_start|>user\n{sample['input']}<|im_end|>\n<|im_start|>assistant\n{sample['output']}<|im_end|>"
+    text = text.replace('\\t', '\t').replace('\\n', '\n')
+    return text
 
 
 class NewInferenceFunction:
@@ -523,15 +521,32 @@ class NewInferenceFunction:
 
         # Part 2: generation sequence inference, saliency on generated sequence
 
-        gen_ids = self.model.generate(
+        gen_out = self.model.generate(
             input_ids=trimmed_ids,
             attention_mask=trimmed_mask,
             max_new_tokens=gen_limit,
             do_sample=False,
             eos_token_id=[self.tokenizer.eos_token_id, self.tokenizer.pad_token_id],
             pad_token_id=self.tokenizer.pad_token_id,
-            return_dict_in_generate=False
+            return_dict_in_generate=True,
+            output_scores=True
         )
+
+        if not isinstance(gen_out, GenerateDecoderOnlyOutput):
+            raise ValueError("Expect gen_out to be GenerateOutput")
+        gen_ids = gen_out.sequences
+        gen_scores = torch.stack(gen_out.scores, dim=0)
+        topk_vals, topk_ids = torch.topk(gen_scores, k=10, dim=-1)  # [steps, batch, 10]
+        topk_map = [
+            [
+                list(zip(
+                    self.tokenizer.convert_ids_to_tokens(ids.tolist()),
+                    vals.tolist()
+                ))
+                for ids, vals in zip(step_ids, step_vals)
+            ]
+            for step_ids, step_vals in zip(topk_ids, topk_vals)
+        ]
 
         if not isinstance(gen_ids, Tensor):
             raise ValueError("Expect gen_ids to be Tensor")
@@ -610,7 +625,9 @@ class NewInferenceFunction:
             "full_tokens": full_tokens,
             "answer_tokens": answer_tokens,
             "saliency_original": saliency_original,
-            "saliency_generation": saliency_generation
+            "saliency_generation": saliency_generation,
+            "pred_scores": gen_scores.tolist(),
+            "pred_token_options": topk_map
         }
     
     def decode_next_token(self, logits, position):
@@ -1065,7 +1082,7 @@ def main_compute_gradient_related_samples():
     collator = CustomCollator(base_collator)
 
     train_loader = DataLoader(
-        DatasetWrapper(train_ds.select(range(100))),  # only check the first 100 training samples
+        DatasetWrapper(train_ds),  # only check the first 100 training samples
         batch_size=1,
         shuffle=False,
         collate_fn=collator
@@ -1110,6 +1127,12 @@ def main_compute_gradient_related_samples():
         "saliency_list": result["saliency_original"][0]
     }
 
+    dumped_json["target_test_sample"]["after"] = {
+        "full_tokens": result["pred_full_tokens"][0],
+        "start_index": result["target_idx"][0],
+        "saliency_list": result["saliency_generation"][0]
+    }
+
     # 2) Rebuild query batch using prediction as new ground truth
     prompt_len = int(result["target_idx"][0])
     prompt_ids = query_batch["input_ids"][0, :prompt_len]
@@ -1141,77 +1164,70 @@ def main_compute_gradient_related_samples():
     # Part 2: use the new gradient
 
     # 3) Empirical influence (overfit on the new ground-truth batch)
-    scores, indices = inference_function.influence_gradient_single(
-        query_batch=query_batch,
-        target_idx=TOKEN_INDEX_TO_RETRIEVE
-    )
+    # scores, indices = inference_function.influence_gradient_single(
+    #     query_batch=query_batch,
+    #     target_idx=TOKEN_INDEX_TO_RETRIEVE
+    # )
 
     # select 20 largest then filter out short ones, we cannot compute token level saliency for too long training samples
-    most_related_samples = nlargest(len(indices), zip(indices, scores), key=lambda x: x[1])
-    pprint(most_related_samples)
+    with open(os.path.join(os.path.dirname(__file__), '../test_34_result.json'), 'r', encoding='utf-8') as f:
+        temp_most_related_samples = json.load(f)
+    most_related_samples = temp_most_related_samples['result']
+    # pprint(most_related_samples)
 
     saliency_analysis_samples = []
     for idx, score in most_related_samples:
-        if train_ds["input_ids"][idx].shape[0] <= SEQUENCE_LENGTH_LIMIT:        # prevent compute_gradients OOM
-            saliency_analysis_samples.append((idx, score))
-    saliency_analysis_samples = saliency_analysis_samples[:10]
+        saliency_analysis_samples.append((idx, score))
+    saliency_analysis_samples = nlargest(10, saliency_analysis_samples, lambda x: -x[1])
+    # saliency_analysis_samples = saliency_analysis_samples[:10]
 
-#     # train on salient samples
-#     for idx, score in saliency_analysis_samples[:1]:
-#         sample = train_samples[idx]
-#         text = '''<|im_start|>system
-# You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
-# <|im_start|>user
-# This is a go programming task on some code contents. Given task: The task is to fill in the missing part of a go function according to the provided code   content. Below is the package path:github.com/kubernetes/Kubernetes/vendor/golang.org/x/tools/go/types/typeutil Below is the code repository: github.com/kubernetes/Kubernetes/ Below is the imported package path "go/types"; "sync" The receiver struct definitions of the function is type MethodSetCache struct {
-#   mu     sync.Mutex
-#   named  map[*types.Named]struct{ value, pointer *types.MethodSet } // method sets for named N and *N
-#   others map[types.Type]*types.MethodSet                            // all other types
-# }
+    # print the top 10 samples as code blocks
+    # and copy them to GPT-5.2 manually,
+    # output to file, or the \t will be converted to spaces in terminal
 
-# // Methods:
-# - func (cache *MethodSetCache) MethodSet(T types.Type) *types.MethodSet
-# - func (cache *MethodSetCache) lookupNamed(named *types.Named) *ast.StructType
-#  The parameter struct definition or not exist of the function is T types.Type The return value struct definitions or not exist of the function is *types.MethodSet The code snippets before the function is not exist And here is the function you are asked to complete func (cache *MethodSetCache) MethodSet(T types.Type) *types.MethodSet
-# func (cache *MethodSetCache) MethodSet(T types.Type) *types.MethodSet {
-#   if cache == nil {
-#     return types.NewMethodSet(T)
-#   }
-#   cache.mu.Lock()
-#   defer cache.mu.Unlock()
+    samples_text = '```\n' + '\n```\n\n```\n'.join(map(convert_sample_to_full_text, [train_samples[i] for i, s in saliency_analysis_samples])) + '\n```'
+    with open(os.path.join(os.path.dirname(__file__), '../samples_in_code_blocks.md'), 'w', encoding='utf-8') as f:
+        f.write(samples_text)
+    
+    # prompt:
+    # Above are full training samples of go code completion, please:
+    # 1. The "<|im_start|>user" part is the question part, and the "<|im_start|>assistant" part is the answer part. The "<MID>" is a completion placeholder which you should not modify or mark. Mark 5 words in the question part that you think that are most contributive, with `<ATTN></ATTN>`. These words must natively appear in the context, and not in the natural languag text, but code text.
+    # 2. Then output only one code block for each sample containing the marked full training sample again, not just the marked part.
 
-#   switch T := types.Unalias(T).(type) {
-#   case *types.Named:
-#     return cache.lookupNamed(T).value
+    # train on salient samples marked by GPT-5.2, which is manually collected
 
-#   case *types.Pointer:
-#     if N, ok := types.Unalias(T.Elem()).(*types.Named); ok {
-#       return cache.lookupNamed(N).pointer
-#     }
-#   }
+    def extract_fenced_code_blocks(text: str) -> list[str]:
+        # 1) Match ```lang?\n ... \n``` with DOTALL to span multiple lines
+        pattern = re.compile(r"```[^\n]*\n(.*?)\n```", re.DOTALL)
+        # 2) Return only the captured code content
+        return pattern.findall(text)
 
-#   // all other types
-#   // (The map uses pointer equivalence, not type identity.)
-#   mset := cache.<ATTN>others</ATTN>[T]
-#   if mset == nil { <MID>   }
-#   return mset
-# } Ensure that only missing codes marked as <MID> are returned<|im_end|>
-# <|im_start|>assistant
-#     mset = types.NewMethodSet(T)
-#     if cache.others == nil {
-#       cache.others = make(map[types.Type]*types.MethodSet)
-#     }
-#     cache.others[T] = mset<|im_end|>'''
-#         token_result = tokenize_with_marked_tokens(text, tokenizer)
+    with open(os.path.join(os.path.dirname(__file__), '../marked_code_samples_4.md'), 'r', encoding='utf-8') as f:
+        file_text = f.read()
+        temp_correlation_train_samples = extract_fenced_code_blocks(file_text)
 
-#         finetune_on_sample(model, tokenizer, epochs=10, input_ids=token_result['input_ids'], labels=token_result['input_ids'].clone(), boost_indices=token_result['marked_indices'])
-#         result = inference_function.infer(query_batch)
-#         print_query_and_answer(result["prev_text"][0], result["answer_text"][0], result["pred_text"][0])
+    token_samples = []
+    for text in temp_correlation_train_samples:
 
-    dumped_json["target_test_sample"]["after"] = {
-        "full_tokens": result["pred_full_tokens"][0],
-        "start_index": result["target_idx"][0],
-        "saliency_list": result["saliency_generation"][0]
-    }
+        token_result = tokenize_with_marked_tokens(text, tokenizer)
+        token_samples.append(token_result)
+
+    for epoch in range(10):
+        for sample in token_samples:
+            finetune_on_sample(
+                model,
+                tokenizer,
+                epochs=1,
+                input_ids=sample['input_ids'],
+                labels=sample['input_ids'].clone(),
+                boost_indices=sample['marked_indices'],
+                boost_coef=10.0
+            )
+    
+    result = inference_function.infer(query_batch)
+    print_query_and_answer(result["prev_text"][0], result["answer_text"][0], result["pred_text"][0])
+
+    # record training sample saliency
 
     for i, sim in tqdm(saliency_analysis_samples, desc='Analyzing training sample saliency'):
         # Build query batch
