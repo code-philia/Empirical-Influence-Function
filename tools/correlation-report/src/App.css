@@ -1,0 +1,22 @@
+.demo-code-block {
+    margin: 2rem auto;
+}
+
+.highlighted-token-code-block {
+    border: 1px solid #333333;
+    margin: 0.3rem auto;
+    padding: 0.5rem;
+    max-height: 80vh;
+    overflow-y: auto;
+}
+
+.highlighted-token-code-block code {
+    font-size: smaller;
+    font-family: 'Cascadia Mono', 'Courier New', Courier, monospace;
+    overflow-wrap: anywhere;
+}
+
+.highlighted-token-code-block span {
+    white-space: pre-wrap;
+    border: 1px solid #ececec;
+}
