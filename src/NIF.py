@@ -107,7 +107,9 @@ class Qwen2ForCausalLMWithLastAttn(Qwen2ForCausalLM):
         )
 
 
-# Unfreeze attention layers
+# Only use attention layers
+# this part was used in IF_HF.py, and is deprecated, now we use all parameters
+
 target_layer_keywords = ["embed_tokens.weight"]  # or ["model.layers.27.mlp"]
 
 def filter_params(name: str, param: Parameter):
@@ -1294,6 +1296,7 @@ def main_compute_gradient_related_samples():
     # compress json size
     dumped_json = round_floats(dumped_json, 5)
 
+    # this file is displayed in tools/correlation-report
     with open('./latest_saliency.json', 'w', encoding = 'utf-8') as f:
         json.dump(dumped_json ,f)
     
