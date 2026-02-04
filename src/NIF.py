@@ -1213,6 +1213,8 @@ def main_compute_gradient_related_samples():
         f.write("\n\n")
         f.write(prompt)
 
+    # then the response of GPT-5.2 should be copied to marked_code_samples.md
+
     # Option 1: train on salient samples marked by GPT-5.2, which is manually collected
 
     def extract_fenced_code_blocks(text: str) -> list[str]:
@@ -1221,7 +1223,7 @@ def main_compute_gradient_related_samples():
         # 2) Return only the captured code content
         return pattern.findall(text)
 
-    with open(os.path.join(os.path.dirname(__file__), '../marked_code_samples_4.md'), 'r', encoding='utf-8') as f:
+    with open(os.path.join(os.path.dirname(__file__), '../marked_code_samples.md'), 'r', encoding='utf-8') as f:
         file_text = f.read()
         temp_correlation_train_samples = extract_fenced_code_blocks(file_text)
 
