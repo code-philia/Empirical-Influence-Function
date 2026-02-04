@@ -16,3 +16,6 @@ accelerate
 tree_sitter
 tree_sitter_go
 torchvision
+peft
+deepspeed
+wandb
